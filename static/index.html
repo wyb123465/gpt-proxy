@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GPT Proxy Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Local GPT proxy</p>
+          <h1>API 管理台</h1>
+        </div>
+        <div class="top-actions">
+          <span id="healthBadge" class="badge muted">检查中</span>
+          <button id="refreshBtn" class="icon-btn" type="button" aria-label="刷新" title="刷新">
+            <span aria-hidden="true">↻</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="summary" aria-label="状态概览">
+        <div class="metric">
+          <span class="metric-label">可用 API</span>
+          <strong id="usableCount">0</strong>
+        </div>
+        <div class="metric">
+          <span class="metric-label">总调用</span>
+          <strong id="totalCalls">0</strong>
+        </div>
+        <div class="metric">
+          <span class="metric-label">默认模型</span>
+          <strong id="modelSummary">未设置</strong>
+        </div>
+      </section>
+
+      <section class="panel usage-panel" aria-label="统一调用地址">
+        <div class="panel-head">
+          <div>
+            <h2>统一调用地址</h2>
+            <p>把其他软件的 API 地址统一改成这里，后端会自动选择你配置的 API。</p>
+          </div>
+        </div>
+
+        <div class="usage-grid">
+          <div class="usage-item">
+            <span>Base URL</span>
+            <code id="baseUrlText">http://127.0.0.1:8000/v1</code>
+            <button class="secondary-btn copy-btn" type="button" data-copy-target="baseUrlText">复制</button>
+          </div>
+          <div class="usage-item">
+            <span>Chat Completions URL</span>
+            <code id="chatUrlText">http://127.0.0.1:8000/v1/chat/completions</code>
+            <button class="secondary-btn copy-btn" type="button" data-copy-target="chatUrlText">复制</button>
+          </div>
+        </div>
+
+        <div class="snippet-box">
+          <div class="snippet-head">
+            <span>Python OpenAI SDK 示例</span>
+            <button class="ghost-btn copy-btn" type="button" data-copy-target="pythonSnippet">复制代码</button>
+          </div>
+          <pre><code id="pythonSnippet">from openai import OpenAI
+
+client = OpenAI(
+    api_key="local-proxy",
+    base_url="http://127.0.0.1:8000/v1",
+)
+
+response = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(response.choices[0].message.content)</code></pre>
+        </div>
+      </section>
+
+      <section class="panel config-panel">
+        <div class="panel-head">
+          <div>
+            <h2>配置 API</h2>
+            <p>优先级数字越小，越先使用；密钥留空会保留旧值。</p>
+          </div>
+          <button id="addProviderBtn" class="secondary-btn" type="button">添加 API</button>
+        </div>
+
+        <label class="field compact">
+          <span>默认模型</span>
+          <input id="defaultModel" autocomplete="off" placeholder="gpt-4o-mini" />
+        </label>
+
+        <div id="providerList" class="provider-list"></div>
+
+        <footer class="form-footer">
+          <p id="saveMessage" class="save-message" role="status"></p>
+          <button id="saveBtn" class="primary-btn" type="button">保存配置</button>
+        </footer>
+      </section>
+    </main>
+
+    <template id="providerTemplate">
+      <article class="provider-card">
+        <div class="provider-head">
+          <div>
+            <h3 class="provider-title">新 API</h3>
+            <p class="provider-meta">未保存</p>
+          </div>
+          <div class="provider-actions">
+            <button class="secondary-btn test-provider" type="button">测试</button>
+            <button class="ghost-btn remove-provider" type="button">删除</button>
+          </div>
+        </div>
+
+        <div class="provider-basic">
+          <label class="field">
+            <span>名称</span>
+            <input data-field="name" autocomplete="off" placeholder="free-1" />
+          </label>
+          <label class="field">
+            <span>优先级</span>
+            <input data-field="priority" type="number" inputmode="numeric" placeholder="1" />
+          </label>
+          <label class="field">
+            <span>Base URL</span>
+            <input data-field="base_url" autocomplete="off" placeholder="https://example.com/v1" />
+          </label>
+        </div>
+
+        <div class="provider-connection">
+          <label class="field">
+            <span>模型</span>
+            <div class="model-input-row">
+              <input data-field="model" autocomplete="off" placeholder="gpt-3.5-turbo" />
+              <button class="secondary-btn fetch-models" type="button">获取模型</button>
+            </div>
+            <div class="model-dropdown" hidden></div>
+          </label>
+          <label class="field">
+            <span>API Key</span>
+            <input data-field="api_key" type="password" autocomplete="new-password" placeholder="留空保留旧密钥" />
+          </label>
+        </div>
+
+        <details class="provider-advanced">
+          <summary>高级选项</summary>
+          <div class="advanced-body">
+            <label class="field checkbox-field">
+              <span>使用 curl 传输 <small>(Cloudflare 站点选此项)</small></span>
+              <input data-field="use_curl" type="checkbox" />
+            </label>
+            <div class="aliases-section">
+              <div class="aliases-head">
+                <span>模型别名 <small>(你的软件发左边的名，代理转成右边)</small></span>
+                <button class="ghost-btn add-alias" type="button">+ 添加</button>
+              </div>
+              <div class="alias-list"></div>
+            </div>
+          </div>
+        </details>
+      </article>
+    </template>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

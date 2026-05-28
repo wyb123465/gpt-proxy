@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  gpt-proxy:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      FREE_GPT_1_KEY: ${FREE_GPT_1_KEY:-}
+      FREE_GPT_2_KEY: ${FREE_GPT_2_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./state.json:/app/state.json
