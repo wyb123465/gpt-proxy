@@ -12,7 +12,7 @@
         <div>
           <p class="eyebrow">Local GPT proxy</p>
           <h1>API 管理台</h1>
-          <p class="lede">把多个 OpenAI 兼容 API 汇总到本地，由代理自动流式转发、回退和轮询密钥。</p>
+          <p class="lede">把多个 OpenAI 兼容 API 汇总到本地，由代理自动流式转发、回退、冷却和轮询密钥。</p>
         </div>
         <div class="top-actions">
           <span id="healthBadge" class="badge muted">检查中</span>
@@ -35,11 +35,35 @@
         </div>
       </section>
 
+      <section class="panel security-panel" aria-label="安全状态">
+        <div class="panel-head">
+          <div>
+            <h2>安全与兼容</h2>
+            <p>这些开关通过环境变量控制，UI 负责显示当前状态；密钥不会在页面回显。</p>
+          </div>
+        </div>
+        <div class="security-grid">
+          <div><span>代理访问密钥</span><strong id="proxyTokenState">未启用</strong></div>
+          <div><span>配置加密</span><strong id="encryptionState">未启用</strong></div>
+          <div><span>本地限流</span><strong id="rateLimitState">未启用</strong></div>
+          <div><span>请求大小限制</span><strong id="bodyLimitState">-</strong></div>
+          <div><span>429 冷却</span><strong id="cooldownState">-</strong></div>
+        </div>
+        <div class="token-row">
+          <label class="field">
+            <span>本地代理访问密钥 <small>如果启用了 `GPT_PROXY_ACCESS_TOKEN`，在这里填写后再刷新</small></span>
+            <input id="localProxyToken" type="password" autocomplete="new-password" placeholder="只保存在浏览器 localStorage" />
+          </label>
+          <button id="saveProxyTokenBtn" class="secondary-btn" type="button">保存密钥</button>
+          <button id="clearProxyTokenBtn" class="ghost-btn" type="button">清除</button>
+        </div>
+      </section>
+
       <section class="panel usage-panel" aria-label="统一调用地址">
         <div class="panel-head">
           <div>
             <h2>统一调用地址</h2>
-            <p>其他软件只需要填这里，模型名可以通过“模型别名”映射到真实后端模型。</p>
+            <p>其他软件只需要填这里；同时支持 `/chat/completions`、`/models` 和基础 `/responses` 兼容。</p>
           </div>
         </div>
 
@@ -83,9 +107,14 @@ for chunk in response:
         <div class="panel-head">
           <div>
             <h2>配置 API</h2>
-            <p>优先级数字越小越先用；多个 Key 会自动轮询，遇到 429 会尝试下一个。</p>
+            <p>优先级数字越小越先用；多个 Key 会自动轮询，遇到 429 会冷却后再用。</p>
           </div>
-          <button id="addProviderBtn" class="secondary-btn" type="button">添加 API</button>
+          <div class="panel-actions">
+            <button id="exportConfigBtn" class="secondary-btn" type="button">导出配置</button>
+            <button id="importConfigBtn" class="secondary-btn" type="button">导入配置</button>
+            <button id="addProviderBtn" class="secondary-btn" type="button">添加 API</button>
+            <input id="importConfigFile" type="file" accept="application/json,.json" hidden />
+          </div>
         </div>
 
         <label class="field compact">
@@ -105,7 +134,7 @@ for chunk in response:
         <div class="panel-head">
           <div>
             <h2>最近请求</h2>
-            <p>显示最近 50 次后端尝试，方便判断是否发生回退、是否走了流式。</p>
+            <p>显示最近 50 次后端尝试，方便判断是否发生回退、是否走了流式、流是否完整结束。</p>
           </div>
           <button id="refreshRequestsBtn" class="secondary-btn" type="button">刷新日志</button>
         </div>
@@ -119,11 +148,12 @@ for chunk in response:
                 <th>耗时</th>
                 <th>回退</th>
                 <th>模式</th>
+                <th>流状态</th>
                 <th>错误</th>
               </tr>
             </thead>
             <tbody id="requestLogBody">
-              <tr><td colspan="7" class="empty-cell">暂无请求记录</td></tr>
+              <tr><td colspan="8" class="empty-cell">暂无请求记录</td></tr>
             </tbody>
           </table>
         </div>

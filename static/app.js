@@ -7,8 +7,16 @@ const usableCount = document.querySelector("#usableCount");
 const totalCalls = document.querySelector("#totalCalls");
 const modelSummary = document.querySelector("#modelSummary");
 const requestLogBody = document.querySelector("#requestLogBody");
+const proxyTokenState = document.querySelector("#proxyTokenState");
+const encryptionState = document.querySelector("#encryptionState");
+const rateLimitState = document.querySelector("#rateLimitState");
+const bodyLimitState = document.querySelector("#bodyLimitState");
+const cooldownState = document.querySelector("#cooldownState");
+const importConfigFile = document.querySelector("#importConfigFile");
+const localProxyTokenInput = document.querySelector("#localProxyToken");
 
 let providers = [];
+localProxyTokenInput.value = localStorage.getItem("gpt_proxy_access_token") || "";
 
 function setMessage(text, type = "") {
   saveMessage.textContent = text;
@@ -21,6 +29,14 @@ function providerMeta(provider) {
   const calls = Number(provider.calls || 0).toLocaleString("zh-CN");
   const remaining = provider.last_remaining ?? "未知";
   return `${enabled} · ${keyState} · 调用 ${calls} 次 · 剩余额度 ${remaining}`;
+}
+
+function renderSecurity(security = {}) {
+  proxyTokenState.textContent = security.proxy_access_token_enabled ? "已启用" : "未启用";
+  encryptionState.textContent = security.config_encryption_enabled ? "已启用" : "未启用";
+  rateLimitState.textContent = security.rate_limit_per_minute > 0 ? `${security.rate_limit_per_minute}/分钟` : "未启用";
+  bodyLimitState.textContent = security.max_request_bytes ? `${Math.round(security.max_request_bytes / 1024)} KB` : "未限制";
+  cooldownState.textContent = security.key_cooldown_seconds ? `${security.key_cooldown_seconds} 秒` : "未启用";
 }
 
 function renderProviders() {
@@ -96,10 +112,28 @@ function refreshSummary() {
   modelSummary.textContent = defaultModelInput.value || "未设置";
 }
 
-async function fetchJson(url, options) {
-  const response = await fetch(url, options);
+function authHeaders() {
+  const token = localStorage.getItem("gpt_proxy_access_token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function withAuth(options = {}) {
+  return {
+    ...options,
+    headers: {
+      ...authHeaders(),
+      ...(options.headers || {}),
+    },
+  };
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, withAuth(options));
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error("需要本地代理访问密钥：请在“安全与兼容”里填写后刷新");
+    }
     throw new Error(data.detail || `请求失败：${response.status}`);
   }
   return data;
@@ -116,6 +150,7 @@ async function loadConfig() {
   healthBadge.className = health ? "badge" : "badge muted";
   defaultModelInput.value = config.default_model || "gpt-4o";
   providers = config.providers || [];
+  renderSecurity(config.security);
   renderProviders();
   await loadRequests();
   setMessage("配置已载入", "ok");
@@ -162,10 +197,49 @@ async function saveConfig() {
     });
     defaultModelInput.value = config.default_model;
     providers = config.providers || [];
+    renderSecurity(config.security);
     renderProviders();
     setMessage("已保存，下一次请求会使用新配置", "ok");
   } catch (error) {
     setMessage(error.message, "error");
+  }
+}
+
+async function exportConfig() {
+  try {
+    const config = await fetchJson("/api/config/export");
+    const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `gpt-proxy-config-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setMessage("配置已导出；请妥善保存，里面包含真实密钥", "ok");
+  } catch (error) {
+    setMessage(error.message, "error");
+  }
+}
+
+async function importConfig(file) {
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const payload = JSON.parse(text);
+    const config = await fetchJson("/api/config/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    defaultModelInput.value = config.default_model;
+    providers = config.providers || [];
+    renderSecurity(config.security);
+    renderProviders();
+    setMessage("配置已导入并保存", "ok");
+  } catch (error) {
+    setMessage(`导入失败：${error.message}`, "error");
+  } finally {
+    importConfigFile.value = "";
   }
 }
 
@@ -318,7 +392,7 @@ function formatTime(value) {
 function renderRequests(requests) {
   requestLogBody.innerHTML = "";
   if (!requests.length) {
-    requestLogBody.innerHTML = '<tr><td colspan="7" class="empty-cell">暂无请求记录</td></tr>';
+    requestLogBody.innerHTML = '<tr><td colspan="8" class="empty-cell">暂无请求记录</td></tr>';
     return;
   }
   requests.forEach((entry) => {
@@ -331,6 +405,7 @@ function renderRequests(requests) {
       <td>${entry.latency_ms ?? "-"} ms</td>
       <td>${entry.fallback_count ?? 0}</td>
       <td>${entry.streamed ? "stream" : "json"}</td>
+      <td>${entry.stream_status || "-"}</td>
       <td class="error-detail">${entry.error || ""}</td>
     `;
     requestLogBody.appendChild(row);
@@ -342,7 +417,7 @@ async function loadRequests() {
     const data = await fetchJson("/api/requests");
     renderRequests(data.requests || []);
   } catch (error) {
-    requestLogBody.innerHTML = `<tr><td colspan="7" class="empty-cell">读取失败：${error.message}</td></tr>`;
+    requestLogBody.innerHTML = `<tr><td colspan="8" class="empty-cell">读取失败：${error.message}</td></tr>`;
   }
 }
 
@@ -385,6 +460,19 @@ document.addEventListener("click", (event) => {
 
 document.querySelector("#addProviderBtn").addEventListener("click", addProvider);
 document.querySelector("#saveBtn").addEventListener("click", saveConfig);
+document.querySelector("#exportConfigBtn").addEventListener("click", exportConfig);
+document.querySelector("#importConfigBtn").addEventListener("click", () => importConfigFile.click());
+importConfigFile.addEventListener("change", () => importConfig(importConfigFile.files?.[0]));
+document.querySelector("#saveProxyTokenBtn").addEventListener("click", () => {
+  localStorage.setItem("gpt_proxy_access_token", localProxyTokenInput.value.trim());
+  setMessage("本地代理访问密钥已保存到浏览器", "ok");
+  loadConfig().catch((error) => setMessage(error.message, "error"));
+});
+document.querySelector("#clearProxyTokenBtn").addEventListener("click", () => {
+  localStorage.removeItem("gpt_proxy_access_token");
+  localProxyTokenInput.value = "";
+  setMessage("本地代理访问密钥已清除", "ok");
+});
 document.querySelector("#refreshRequestsBtn").addEventListener("click", loadRequests);
 document.querySelector("#refreshBtn").addEventListener("click", () => {
   loadConfig().catch((error) => setMessage(error.message, "error"));

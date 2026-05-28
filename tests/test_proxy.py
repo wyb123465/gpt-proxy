@@ -518,3 +518,299 @@ def test_streaming_chat_completion_proxies_event_stream(tmp_path, monkeypatch):
     assert response.headers["content-type"].startswith("text/event-stream")
     assert 'data: {"choices"' in body
     assert "data: [DONE]" in body
+
+
+def test_proxy_access_token_protects_v1_endpoints(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0)])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "PROXY_ACCESS_TOKEN", "local-secret", raising=False)
+
+    client = TestClient(main.app)
+    denied = client.post("/v1/chat/completions", json={"messages": []})
+
+    assert denied.status_code == 401
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    allowed = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer local-secret"},
+        json={"messages": []},
+    )
+
+    assert allowed.status_code == 200
+
+
+def test_v1_rate_limit_returns_429(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0)])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1, raising=False)
+    monkeypatch.setattr(main, "RATE_LIMIT_BUCKETS", {}, raising=False)
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 200
+    assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 429
+
+
+def test_v1_request_body_size_limit_returns_413(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0)])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "MAX_REQUEST_BYTES", 20, raising=False)
+
+    client = TestClient(main.app)
+    response = client.post("/v1/chat/completions", json={"messages": [{"content": "too large"}]})
+
+    assert response.status_code == 413
+
+
+def test_models_endpoint_aggregates_provider_models(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            make_provider("official", 0),
+            make_provider("free", 1),
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    def handler(request):
+        if str(request.url) == "https://official.example/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "gpt-4o"}]})
+        if str(request.url) == "https://free.example/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "mimo-v2.5"}, {"id": "gpt-4o"}]})
+        return httpx.Response(404)
+
+    class MockAsyncClient(httpx.AsyncClient):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+
+    client = TestClient(main.app)
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert [model["id"] for model in response.json()["data"]] == ["gpt-4o", "mimo-v2.5"]
+
+
+def test_429_cools_down_key_for_next_request(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "free",
+                "base_url": "https://free.example/v1",
+                "priority": 0,
+                "api_keys": ["quota-key", "fresh-key"],
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "KEY_COOLDOWN_SECONDS", 60, raising=False)
+
+    seen_auth = []
+
+    def handler(request):
+        seen_auth.append(request.headers["authorization"])
+        if request.headers["authorization"] == "Bearer quota-key":
+            return httpx.Response(429, json={"error": {"message": "quota"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 200
+    assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 200
+
+    assert seen_auth == ["Bearer quota-key", "Bearer fresh-key", "Bearer fresh-key"]
+
+
+def test_responses_endpoint_returns_response_shape(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0)])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    def handler(request):
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["messages"] == [{"role": "user", "content": "hello"}]
+        return httpx.Response(200, json={"model": "default-model", "choices": [{"message": {"content": "hi"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1/responses", json={"model": "gpt-4o", "input": "hello"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "response"
+    assert data["output_text"] == "hi"
+    assert data["output"][0]["content"][0]["text"] == "hi"
+
+
+def test_config_export_and_import_roundtrip(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    original = [make_provider("official", 0, api_key="secret-key")]
+    write_config(config_path, original)
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    client = TestClient(main.app)
+    exported = client.get("/api/config/export")
+
+    assert exported.status_code == 200
+    assert exported.json()["providers"][0]["api_key"] == "secret-key"
+
+    imported = client.post(
+        "/api/config/import",
+        json={
+            "default_model": "imported-model",
+            "providers": [
+                {
+                    "name": "imported",
+                    "base_url": "https://imported.example/v1",
+                    "priority": 0,
+                    "api_keys": ["new-secret"],
+                }
+            ],
+        },
+    )
+
+    assert imported.status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["default_model"] == "imported-model"
+    assert saved["providers"][0]["api_key"] == "new-secret"
+
+
+def test_proxy_access_token_protects_management_config_export(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0, api_key="secret-key")])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "PROXY_ACCESS_TOKEN", "local-secret", raising=False)
+
+    client = TestClient(main.app)
+    denied = client.get("/api/config/export")
+    allowed = client.get("/api/config/export", headers={"Authorization": "Bearer local-secret"})
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+    assert allowed.json()["providers"][0]["api_key"] == "secret-key"
+
+
+def test_config_keys_can_be_encrypted_at_rest(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "CONFIG_ENCRYPTION_SECRET", "passphrase", raising=False)
+    state_path.write_text("{}", encoding="utf-8")
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/api/config",
+        json={
+            "default_model": "default-model",
+            "providers": [
+                {
+                    "name": "official",
+                    "base_url": "https://official.example/v1",
+                    "priority": 0,
+                    "api_keys": ["secret-key"],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    raw = config_path.read_text(encoding="utf-8")
+    assert "secret-key" not in raw
+
+    config = main.load_config()
+    assert main.provider_api_keys(config["providers"][0]) == ["secret-key"]
+
+
+def test_encrypted_config_requires_secret(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "CONFIG_ENCRYPTION_SECRET", "passphrase", raising=False)
+    state_path.write_text("{}", encoding="utf-8")
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/api/config",
+        json={
+            "default_model": "default-model",
+            "providers": [
+                {
+                    "name": "official",
+                    "base_url": "https://official.example/v1",
+                    "priority": 0,
+                    "api_keys": ["secret-key"],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+
+    monkeypatch.setattr(main, "CONFIG_ENCRYPTION_SECRET", "", raising=False)
+
+    try:
+        main.load_config()
+    except RuntimeError as exc:
+        assert "GPT_PROXY_CONFIG_SECRET" in str(exc)
+    else:
+        raise AssertionError("Encrypted config loaded without GPT_PROXY_CONFIG_SECRET")

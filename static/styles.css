@@ -55,11 +55,16 @@ h3 { font-size: 17px; }
   line-height: 1.6;
 }
 
-.top-actions, .form-footer, .panel-head, .provider-head {
+.top-actions, .form-footer, .panel-head, .provider-head, .panel-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
+}
+
+.panel-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .badge {
@@ -381,6 +386,43 @@ button:disabled {
 
 .usage-panel { margin-bottom: 16px; }
 .config-panel { margin-bottom: 16px; }
+.security-panel { margin-bottom: 16px; }
+
+.security-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.security-grid div {
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.security-grid span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.security-grid strong {
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.token-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
 
 .usage-grid {
   display: grid;
@@ -448,6 +490,8 @@ button:disabled {
   .provider-basic, .provider-connection { grid-template-columns: 1fr; }
   .primary-btn, .secondary-btn { width: 100%; }
   .usage-grid, .usage-item { grid-template-columns: 1fr; }
+  .security-grid { grid-template-columns: 1fr; }
+  .token-row { grid-template-columns: 1fr; }
 }
 
 .request-table-wrap {
