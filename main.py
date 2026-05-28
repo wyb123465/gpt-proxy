@@ -1,13 +1,15 @@
-import json
 import asyncio
+import json
 import logging
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -16,6 +18,7 @@ STATIC_DIR = BASE_DIR / "static"
 CONFIG_PATH = Path(os.getenv("GPT_PROXY_CONFIG", BASE_DIR / "config.json"))
 STATE_PATH = Path(os.getenv("GPT_PROXY_STATE", BASE_DIR / "state.json"))
 RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
+REQUEST_LOG_LIMIT = 50
 
 app = FastAPI(title="Local GPT API Proxy")
 if STATIC_DIR.exists():
@@ -52,6 +55,26 @@ def write_json_file(path: Path, data: Any) -> None:
     temp_path.replace(path)
 
 
+def load_state() -> dict[str, Any]:
+    return read_json_file(STATE_PATH, {})
+
+
+def save_state(state: dict[str, Any]) -> None:
+    write_json_file(STATE_PATH, state)
+
+
+def provider_api_keys(provider: dict[str, Any]) -> list[str]:
+    keys = []
+    api_keys = provider.get("api_keys")
+    if isinstance(api_keys, list):
+        keys.extend(str(key).strip() for key in api_keys if str(key).strip())
+    if provider.get("api_key"):
+        api_key = str(provider["api_key"]).strip()
+        if api_key and api_key not in keys:
+            keys.append(api_key)
+    return keys
+
+
 def apply_env_overrides(provider: dict[str, Any]) -> dict[str, Any]:
     provider = dict(provider)
     env_key_name = provider.get("api_key_env")
@@ -73,20 +96,36 @@ def load_config() -> dict[str, Any]:
     providers = [
         provider
         for provider in providers
-        if provider.get("name") and provider.get("base_url") and provider.get("api_key")
+        if provider.get("enabled", True)
+        and provider.get("name")
+        and provider.get("base_url")
+        and provider_api_keys(provider)
     ]
     config["providers"] = sorted(providers, key=lambda item: item.get("priority", 1000))
     return config
 
 
-def load_state() -> dict[str, Any]:
-    return read_json_file(STATE_PATH, {})
+def key_attempt_order(provider: dict[str, Any], state: dict[str, Any]) -> list[tuple[int, str]]:
+    keys = provider_api_keys(provider)
+    if not keys:
+        return []
+    provider_state = state.get(provider["name"], {})
+    start_index = int(provider_state.get("key_index", 0)) % len(keys)
+    ordered_indexes = list(range(start_index, len(keys))) + list(range(0, start_index))
+    return [(index, keys[index]) for index in ordered_indexes]
 
 
-def record_success(provider_name: str, response: httpx.Response) -> None:
+def record_success(
+    provider_name: str,
+    response: httpx.Response,
+    key_count: int = 1,
+    key_index: int | None = None,
+) -> None:
     state = load_state()
     provider_state = state.setdefault(provider_name, {"calls": 0, "last_remaining": None})
     provider_state["calls"] = int(provider_state.get("calls", 0)) + 1
+    if key_index is not None and key_count > 0:
+        provider_state["key_index"] = (key_index + 1) % key_count
 
     remaining = response.headers.get("x-ratelimit-remaining")
     if remaining is not None:
@@ -95,7 +134,35 @@ def record_success(provider_name: str, response: httpx.Response) -> None:
         except ValueError:
             provider_state["last_remaining"] = remaining
 
-    write_json_file(STATE_PATH, state)
+    save_state(state)
+
+
+def request_log_entry(
+    provider_name: str,
+    status: int | str,
+    started_at: float,
+    fallback_count: int,
+    error: str | None = None,
+    streamed: bool = False,
+) -> dict[str, Any]:
+    return {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "path": "/v1/chat/completions",
+        "provider": provider_name,
+        "status": status,
+        "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "fallback_count": fallback_count,
+        "streamed": streamed,
+        "error": error,
+    }
+
+
+def append_request_log(entry: dict[str, Any]) -> None:
+    state = load_state()
+    requests = state.setdefault("_requests", [])
+    requests.insert(0, entry)
+    del requests[REQUEST_LOG_LIMIT:]
+    save_state(state)
 
 
 def build_request_body(body: dict[str, Any], provider: dict[str, Any], default_model: str) -> dict[str, Any]:
@@ -111,17 +178,39 @@ def build_request_body(body: dict[str, Any], provider: dict[str, Any], default_m
     return request_body
 
 
-async def curl_request(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 30.0) -> tuple[int, str, dict[str, str]]:
+def build_forward_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def should_use_curl(provider: dict[str, Any]) -> bool:
+    return bool(provider.get("use_curl"))
+
+
+async def curl_request(
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    timeout: float = 30.0,
+) -> tuple[int, str, dict[str, str]]:
     curl_headers = []
     for key, value in headers.items():
         curl_headers += ["-H", f"{key}: {value}"]
     cmd = [
-        "curl.exe", "-s", "-S",
-        "--max-time", str(int(timeout)),
-        "-w", "\n%{http_code}",
-        "-X", "POST",
+        "curl.exe",
+        "-s",
+        "-S",
+        "--max-time",
+        str(int(timeout)),
+        "-w",
+        "\n%{http_code}",
+        "-X",
+        "POST",
         *curl_headers,
-        "-d", json.dumps(body, ensure_ascii=False),
+        "-d",
+        json.dumps(body, ensure_ascii=False),
         url,
     ]
     proc = await asyncio.create_subprocess_exec(
@@ -129,7 +218,7 @@ async def curl_request(url: str, headers: dict[str, str], body: dict[str, Any], 
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    stdout, _ = await proc.communicate()
     output = stdout.decode("utf-8", errors="replace")
     if "\n" in output:
         *body_lines, status_line = output.split("\n")
@@ -144,25 +233,15 @@ async def curl_request(url: str, headers: dict[str, str], body: dict[str, Any], 
     return status_code, response_text, {}
 
 
-def should_use_curl(provider: dict[str, Any]) -> bool:
-    return bool(provider.get("use_curl"))
-
-
-def build_forward_headers(provider: dict[str, Any]) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {provider['api_key']}",
-        "Content-Type": "application/json",
-    }
-
-
 async def forward_to_provider(
     client: httpx.AsyncClient,
     body: dict[str, Any],
     provider: dict[str, Any],
     default_model: str,
+    api_key: str,
 ) -> httpx.Response:
     url = f"{provider['base_url'].rstrip('/')}/chat/completions"
-    headers = build_forward_headers(provider)
+    headers = build_forward_headers(api_key)
     request_body = build_request_body(body, provider, default_model)
     return await client.post(url, headers=headers, json=request_body)
 
@@ -171,10 +250,11 @@ async def curl_forward_to_provider(
     body: dict[str, Any],
     provider: dict[str, Any],
     default_model: str,
+    api_key: str,
     timeout: float = 30.0,
 ) -> tuple[int, Any]:
     url = f"{provider['base_url'].rstrip('/')}/chat/completions"
-    headers = build_forward_headers(provider)
+    headers = build_forward_headers(api_key)
     request_body = build_request_body(body, provider, default_model)
     status_code, response_text, _ = await curl_request(url, headers, request_body, timeout)
     try:
@@ -184,29 +264,41 @@ async def curl_forward_to_provider(
     return status_code, data
 
 
+def safe_response_detail(response: httpx.Response) -> dict[str, Any]:
+    try:
+        return response.json()
+    except json.JSONDecodeError:
+        return {"detail": response.text}
+
+
 async def check_provider(provider: dict[str, Any], default_model: str) -> dict[str, Any]:
+    keys = provider_api_keys(provider)
+    if not keys:
+        return {"ok": False, "status": "no_api_key", "detail": "该 API 尚未填写密钥"}
+
     body = {
         "model": provider.get("model") or default_model or "gpt-3.5-turbo",
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 1,
     }
+    api_key = keys[0]
     if should_use_curl(provider):
         try:
-            status_code, data = await curl_forward_to_provider(body, provider, default_model, timeout=15.0)
+            status_code, data = await curl_forward_to_provider(body, provider, default_model, api_key, timeout=15.0)
         except Exception as exc:
             return {"ok": False, "status": "request_error", "detail": str(exc)}
         if status_code == 200:
             return {"ok": True, "status": 200, "detail": "Provider responded successfully"}
         return {"ok": False, "status": status_code, "detail": data}
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-                response = await forward_to_provider(client, body, provider, default_model)
-        except httpx.RequestError as exc:
-            return {"ok": False, "status": "request_error", "detail": str(exc)}
-        if response.status_code == 200:
-            return {"ok": True, "status": 200, "detail": "Provider responded successfully"}
-        return {"ok": False, "status": response.status_code, "detail": safe_response_detail(response)}
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            response = await forward_to_provider(client, body, provider, default_model, api_key)
+    except httpx.RequestError as exc:
+        return {"ok": False, "status": "request_error", "detail": str(exc)}
+    if response.status_code == 200:
+        return {"ok": True, "status": 200, "detail": "Provider responded successfully"}
+    return {"ok": False, "status": response.status_code, "detail": safe_response_detail(response)}
 
 
 def normalize_provider(provider: dict[str, Any], existing_provider: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -216,6 +308,7 @@ def normalize_provider(provider: dict[str, Any], existing_provider: dict[str, An
     api_key = str(provider.get("api_key", "")).strip()
     api_key_env = str(provider.get("api_key_env", "")).strip()
     use_curl = bool(provider.get("use_curl", False))
+    enabled = bool(provider.get("enabled", True))
     model_aliases = provider.get("model_aliases") or {}
     if not isinstance(model_aliases, dict):
         model_aliases = {}
@@ -235,16 +328,24 @@ def normalize_provider(provider: dict[str, Any], existing_provider: dict[str, An
         "base_url": base_url,
         "model": model,
         "priority": priority,
+        "enabled": enabled,
     }
 
+    keys = []
+    api_keys = provider.get("api_keys")
+    if isinstance(api_keys, list):
+        keys = [str(key).strip() for key in api_keys if str(key).strip()]
     if api_key:
-        normalized["api_key"] = api_key
-    elif existing_provider and existing_provider.get("api_key"):
-        normalized["api_key"] = existing_provider["api_key"]
+        keys = [api_key]
+    elif not keys and existing_provider:
+        keys = provider_api_keys(existing_provider)
+    if keys:
+        normalized["api_keys"] = keys
+        normalized["api_key"] = keys[0]
 
     if api_key_env:
         normalized["api_key_env"] = api_key_env
-    elif existing_provider and existing_provider.get("api_key_env") and not api_key:
+    elif existing_provider and existing_provider.get("api_key_env") and not keys:
         normalized["api_key_env"] = existing_provider["api_key_env"]
 
     if use_curl or (existing_provider and existing_provider.get("use_curl") and not api_key):
@@ -259,14 +360,18 @@ def normalize_provider(provider: dict[str, Any], existing_provider: dict[str, An
 def editable_provider(provider: dict[str, Any], state: dict[str, Any], default_model: str) -> dict[str, Any]:
     provider_state = state.get(provider.get("name", ""), {})
     resolved = apply_env_overrides(provider)
+    keys = provider_api_keys(resolved)
     return {
         "name": provider.get("name", ""),
         "base_url": provider.get("base_url", ""),
         "model": provider.get("model", default_model),
         "priority": provider.get("priority", 1000),
         "api_key": "",
+        "api_keys": [],
         "api_key_env": provider.get("api_key_env", ""),
-        "has_api_key": bool(resolved.get("api_key")),
+        "has_api_key": bool(keys),
+        "key_count": len(keys),
+        "enabled": bool(provider.get("enabled", True)),
         "use_curl": bool(provider.get("use_curl", False)),
         "model_aliases": provider.get("model_aliases") or {},
         "calls": provider_state.get("calls", 0),
@@ -274,11 +379,83 @@ def editable_provider(provider: dict[str, Any], state: dict[str, Any], default_m
     }
 
 
-def safe_response_detail(response: httpx.Response) -> dict[str, Any]:
+async def stream_response_bytes(response: httpx.Response, client: httpx.AsyncClient) -> AsyncIterator[bytes]:
     try:
-        return response.json()
-    except json.JSONDecodeError:
-        return {"detail": response.text}
+        async for chunk in response.aiter_bytes():
+            if chunk:
+                yield chunk
+    finally:
+        await response.aclose()
+        await client.aclose()
+
+
+async def stream_chat_completions(body: dict[str, Any], config: dict[str, Any]) -> StreamingResponse:
+    last_error = "所有后端 API 均不可用"
+    fallback_count = 0
+    state = load_state()
+
+    for provider in config["providers"]:
+        provider_name = provider["name"]
+        key_attempts = key_attempt_order(provider, state)
+        for key_index, api_key in key_attempts:
+            started_at = time.perf_counter()
+            if should_use_curl(provider):
+                try:
+                    status_code, data = await curl_forward_to_provider(body, provider, config["default_model"], api_key)
+                except Exception as exc:
+                    last_error = str(exc)
+                    append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error, True))
+                    fallback_count += 1
+                    continue
+
+                logger.info("provider=%s status=%s path=/v1/chat/completions", provider_name, status_code)
+                append_request_log(request_log_entry(provider_name, status_code, started_at, fallback_count, streamed=True))
+                if status_code == 200:
+                    record_success(provider_name, httpx.Response(200, json={}), len(key_attempts), key_index)
+                    payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+                    return StreamingResponse(iter([payload.encode("utf-8")]), media_type="text/event-stream")
+                if status_code in RETRYABLE_STATUS_CODES:
+                    last_error = json.dumps(data, ensure_ascii=False)
+                    fallback_count += 1
+                    continue
+                raise HTTPException(status_code=status_code, detail=data)
+
+            client = create_http_client()
+            try:
+                url = f"{provider['base_url'].rstrip('/')}/chat/completions"
+                headers = build_forward_headers(api_key)
+                request_body = build_request_body(body, provider, config["default_model"])
+                upstream_request = client.build_request("POST", url, headers=headers, json=request_body)
+                response = await client.send(upstream_request, stream=True)
+            except httpx.RequestError as exc:
+                await client.aclose()
+                last_error = str(exc)
+                append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error, True))
+                fallback_count += 1
+                continue
+
+            logger.info("provider=%s status=%s path=/v1/chat/completions", provider_name, response.status_code)
+            if response.status_code == 200:
+                record_success(provider_name, response, len(key_attempts), key_index)
+                append_request_log(request_log_entry(provider_name, response.status_code, started_at, fallback_count, streamed=True))
+                return StreamingResponse(
+                    stream_response_bytes(response, client),
+                    media_type=response.headers.get("content-type", "text/event-stream"),
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+
+            error_bytes = await response.aread()
+            await response.aclose()
+            await client.aclose()
+            error_text = error_bytes.decode("utf-8", errors="replace")
+            append_request_log(request_log_entry(provider_name, response.status_code, started_at, fallback_count, error_text, True))
+            if response.status_code in RETRYABLE_STATUS_CODES:
+                last_error = error_text
+                fallback_count += 1
+                continue
+            raise HTTPException(status_code=response.status_code, detail=error_text)
+
+    raise HTTPException(status_code=502, detail=last_error)
 
 
 @app.get("/")
@@ -290,7 +467,7 @@ def dashboard() -> FileResponse:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> JSONResponse:
+async def chat_completions(request: Request):
     config = load_config()
     providers = config["providers"]
     if not providers:
@@ -301,46 +478,61 @@ async def chat_completions(request: Request) -> JSONResponse:
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
 
-    last_error = "All backend providers failed"
-    curl_providers = [p for p in providers if should_use_curl(p)]
-    httpx_providers = [p for p in providers if not should_use_curl(p)]
+    if body.get("stream") is True:
+        return await stream_chat_completions(body, config)
 
-    for provider in curl_providers:
-        provider_name = provider["name"]
-        try:
-            status_code, data = await curl_forward_to_provider(body, provider, config["default_model"])
-        except Exception as exc:
-            logger.info("provider=%s status=request_error path=/v1/chat/completions", provider_name)
-            last_error = str(exc)
-            continue
-        logger.info("provider=%s status=%s path=/v1/chat/completions", provider_name, status_code)
-        if status_code == 200:
-            record_success(provider_name, httpx.Response(200, json=data))
-            return JSONResponse(content=data, status_code=200)
-        if status_code in RETRYABLE_STATUS_CODES:
-            last_error = json.dumps(data)
-            continue
-        return JSONResponse(content=data, status_code=status_code)
+    last_error = "所有后端 API 均不可用"
+    fallback_count = 0
+    state = load_state()
 
     async with create_http_client() as client:
-        for provider in httpx_providers:
+        for provider in providers:
             provider_name = provider["name"]
-            try:
-                response = await forward_to_provider(client, body, provider, config["default_model"])
-            except httpx.RequestError as exc:
-                logger.info("provider=%s status=request_error path=/v1/chat/completions", provider_name)
-                last_error = str(exc)
-                continue
-            logger.info("provider=%s status=%s path=/v1/chat/completions", provider_name, response.status_code)
-            if response.status_code == 200:
-                record_success(provider_name, response)
-                return JSONResponse(content=response.json(), status_code=200)
-            if response.status_code in RETRYABLE_STATUS_CODES:
-                last_error = response.text
-                continue
-            return JSONResponse(content=safe_response_detail(response), status_code=response.status_code)
+            key_attempts = key_attempt_order(provider, state)
+            for key_index, api_key in key_attempts:
+                started_at = time.perf_counter()
+                if should_use_curl(provider):
+                    try:
+                        status_code, data = await curl_forward_to_provider(body, provider, config["default_model"], api_key)
+                    except Exception as exc:
+                        logger.info("provider=%s status=request_error path=/v1/chat/completions", provider_name)
+                        last_error = str(exc)
+                        append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error))
+                        fallback_count += 1
+                        continue
 
-    raise HTTPException(status_code=502, detail=last_error or "All backend providers failed")
+                    logger.info("provider=%s status=%s path=/v1/chat/completions", provider_name, status_code)
+                    append_request_log(request_log_entry(provider_name, status_code, started_at, fallback_count))
+                    if status_code == 200:
+                        record_success(provider_name, httpx.Response(200, json=data), len(key_attempts), key_index)
+                        return JSONResponse(content=data, status_code=200)
+                    if status_code in RETRYABLE_STATUS_CODES:
+                        last_error = json.dumps(data, ensure_ascii=False)
+                        fallback_count += 1
+                        continue
+                    return JSONResponse(content=data, status_code=status_code)
+
+                try:
+                    response = await forward_to_provider(client, body, provider, config["default_model"], api_key)
+                except httpx.RequestError as exc:
+                    logger.info("provider=%s status=request_error path=/v1/chat/completions", provider_name)
+                    last_error = str(exc)
+                    append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error))
+                    fallback_count += 1
+                    continue
+
+                logger.info("provider=%s status=%s path=/v1/chat/completions", provider_name, response.status_code)
+                append_request_log(request_log_entry(provider_name, response.status_code, started_at, fallback_count))
+                if response.status_code == 200:
+                    record_success(provider_name, response, len(key_attempts), key_index)
+                    return JSONResponse(content=response.json(), status_code=200)
+                if response.status_code in RETRYABLE_STATUS_CODES:
+                    last_error = response.text
+                    fallback_count += 1
+                    continue
+                return JSONResponse(content=safe_response_detail(response), status_code=response.status_code)
+
+    raise HTTPException(status_code=502, detail=last_error)
 
 
 @app.get("/health")
@@ -409,11 +601,19 @@ def provider_status() -> dict[str, Any]:
                 "base_url": provider["base_url"],
                 "model": provider.get("model", config["default_model"]),
                 "priority": provider.get("priority", 1000),
+                "enabled": provider.get("enabled", True),
+                "key_count": len(provider_api_keys(provider)),
                 "calls": state.get(provider["name"], {}).get("calls", 0),
                 "last_remaining": state.get(provider["name"], {}).get("last_remaining"),
             }
         )
     return {"providers": providers}
+
+
+@app.get("/api/requests")
+def recent_requests() -> dict[str, Any]:
+    state = load_state()
+    return {"requests": state.get("_requests", [])[:REQUEST_LOG_LIMIT]}
 
 
 @app.post("/api/providers/{provider_name}/check")
@@ -430,7 +630,7 @@ async def provider_check(provider_name: str) -> dict[str, Any]:
             "provider": provider_name,
             "ok": False,
             "status": "no_api_key",
-            "detail": "该 API 尚未填写密钥，请先在 UI 中输入 API Key 并保存",
+            "detail": "该 API 尚未启用或尚未填写密钥，请先在 UI 中启用并输入 API Key 后保存",
         }
     raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' does not exist in config")
 
@@ -441,9 +641,10 @@ async def provider_models(provider_name: str) -> dict[str, Any]:
     for provider in config["providers"]:
         if provider["name"] == provider_name:
             url = f"{provider['base_url'].rstrip('/')}/models"
-            headers = {"Authorization": f"Bearer {provider['api_key']}", "Accept": "application/json"}
+            api_key = provider_api_keys(provider)[0]
+            headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
             if should_use_curl(provider):
-                cmd = ["curl.exe", "-s", "-S", "--max-time", "15", "-H", f"Authorization: Bearer {provider['api_key']}", url]
+                cmd = ["curl.exe", "-s", "-S", "--max-time", "15", "-H", f"Authorization: Bearer {api_key}", url]
                 proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 stdout, _ = await proc.communicate()
                 try:
@@ -451,8 +652,8 @@ async def provider_models(provider_name: str) -> dict[str, Any]:
                 except json.JSONDecodeError:
                     data = {"raw": stdout.decode("utf-8", errors="replace")}
                 return {"provider": provider_name, "models": data}
-            else:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.get(url, headers=headers)
-                return {"provider": provider_name, "status": resp.status_code, "models": resp.json()}
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, headers=headers)
+            return {"provider": provider_name, "status": resp.status_code, "models": resp.json()}
     raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")

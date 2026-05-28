@@ -21,7 +21,7 @@ body {
   color: var(--ink);
 }
 
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 
 .shell {
   width: min(1120px, calc(100% - 32px));
@@ -48,6 +48,12 @@ h1, h2, h3, p { margin: 0; }
 h1 { font-size: clamp(30px, 4vw, 44px); line-height: 1.05; }
 h2 { font-size: 22px; }
 h3 { font-size: 17px; }
+.lede {
+  max-width: 720px;
+  margin-top: 10px;
+  color: var(--muted);
+  line-height: 1.6;
+}
 
 .top-actions, .form-footer, .panel-head, .provider-head {
   display: flex;
@@ -113,7 +119,7 @@ h3 { font-size: 17px; }
 }
 
 button:hover { transform: translateY(-1px); }
-button:focus-visible, input:focus-visible {
+button:focus-visible, input:focus-visible, textarea:focus-visible {
   outline: 3px solid rgba(15, 118, 110, 0.24);
   outline-offset: 2px;
 }
@@ -190,14 +196,32 @@ button:disabled {
   font-weight: 700;
 }
 
-.field input {
+.field input,
+.field textarea {
   width: 100%;
-  min-height: 42px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 0 12px;
   color: var(--ink);
   background: var(--surface-soft);
+}
+
+.field input {
+  min-height: 42px;
+  padding: 0 12px;
+}
+
+.field textarea {
+  min-height: 90px;
+  resize: vertical;
+  padding: 10px 12px;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.field small {
+  color: var(--muted);
+  font-weight: 400;
 }
 
 .field.compact {
@@ -356,6 +380,7 @@ button:disabled {
 .save-message.ok { color: var(--accent-strong); }
 
 .usage-panel { margin-bottom: 16px; }
+.config-panel { margin-bottom: 16px; }
 
 .usage-grid {
   display: grid;
@@ -423,4 +448,48 @@ button:disabled {
   .provider-basic, .provider-connection { grid-template-columns: 1fr; }
   .primary-btn, .secondary-btn { width: 100%; }
   .usage-grid, .usage-item { grid-template-columns: 1fr; }
+}
+
+.request-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.request-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 760px;
+  background: var(--surface-soft);
+}
+
+.request-table th,
+.request-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  font-size: 13px;
+  vertical-align: top;
+}
+
+.request-table th {
+  color: var(--muted);
+  font-weight: 800;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.request-table tr:last-child td { border-bottom: 0; }
+
+.empty-cell {
+  color: var(--muted);
+  text-align: center !important;
+}
+
+.ok-text { color: var(--accent-strong); font-weight: 800; }
+.error-text { color: var(--danger); font-weight: 800; }
+
+.error-detail {
+  max-width: 280px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }

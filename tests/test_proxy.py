@@ -339,3 +339,182 @@ def test_model_alias_replaces_model_name(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert seen_body["model"] == "mimo-v2.5"
+
+
+def test_disabled_provider_is_skipped(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {**make_provider("disabled", 0), "enabled": False},
+            make_provider("active", 1),
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1/chat/completions", json={"messages": []})
+
+    assert response.status_code == 200
+    assert calls == ["https://active.example/v1/chat/completions"]
+
+
+def test_provider_rotates_multiple_api_keys(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "free",
+                "base_url": "https://free.example/v1",
+                "priority": 0,
+                "api_keys": ["key-1", "key-2"],
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen_auth = []
+
+    def handler(request):
+        seen_auth.append(request.headers["authorization"])
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 200
+    assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 200
+
+    assert seen_auth == ["Bearer key-1", "Bearer key-2"]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["free"]["calls"] == 2
+    assert state["free"]["key_index"] == 0
+
+
+def test_provider_tries_next_key_after_quota_error(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "free",
+                "base_url": "https://free.example/v1",
+                "priority": 0,
+                "api_keys": ["quota-key", "fresh-key"],
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen_auth = []
+
+    def handler(request):
+        seen_auth.append(request.headers["authorization"])
+        if request.headers["authorization"] == "Bearer quota-key":
+            return httpx.Response(429, json={"error": {"message": "quota"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1/chat/completions", json={"messages": []})
+
+    assert response.status_code == 200
+    assert seen_auth == ["Bearer quota-key", "Bearer fresh-key"]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["free"]["key_index"] == 0
+
+
+def test_request_log_records_recent_attempts(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0)])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1/chat/completions", json={"messages": []})
+    logs = client.get("/api/requests")
+
+    assert response.status_code == 200
+    assert logs.status_code == 200
+    entry = logs.json()["requests"][0]
+    assert entry["provider"] == "official"
+    assert entry["status"] == 200
+    assert entry["path"] == "/v1/chat/completions"
+    assert entry["latency_ms"] >= 0
+
+
+def test_streaming_chat_completion_proxies_event_stream(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0)])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": [], "stream": True},
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert 'data: {"choices"' in body
+    assert "data: [DONE]" in body

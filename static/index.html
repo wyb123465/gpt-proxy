@@ -12,12 +12,11 @@
         <div>
           <p class="eyebrow">Local GPT proxy</p>
           <h1>API 管理台</h1>
+          <p class="lede">把多个 OpenAI 兼容 API 汇总到本地，由代理自动流式转发、回退和轮询密钥。</p>
         </div>
         <div class="top-actions">
           <span id="healthBadge" class="badge muted">检查中</span>
-          <button id="refreshBtn" class="icon-btn" type="button" aria-label="刷新" title="刷新">
-            <span aria-hidden="true">↻</span>
-          </button>
+          <button id="refreshBtn" class="icon-btn" type="button" aria-label="刷新" title="刷新">↻</button>
         </div>
       </header>
 
@@ -40,7 +39,7 @@
         <div class="panel-head">
           <div>
             <h2>统一调用地址</h2>
-            <p>把其他软件的 API 地址统一改成这里，后端会自动选择你配置的 API。</p>
+            <p>其他软件只需要填这里，模型名可以通过“模型别名”映射到真实后端模型。</p>
           </div>
         </div>
 
@@ -70,10 +69,13 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gpt-3.5-turbo",
+    model="gpt-4o",
     messages=[{"role": "user", "content": "你好"}],
+    stream=True,
 )
-print(response.choices[0].message.content)</code></pre>
+
+for chunk in response:
+    print(chunk.choices[0].delta.content or "", end="")</code></pre>
         </div>
       </section>
 
@@ -81,14 +83,14 @@ print(response.choices[0].message.content)</code></pre>
         <div class="panel-head">
           <div>
             <h2>配置 API</h2>
-            <p>优先级数字越小，越先使用；密钥留空会保留旧值。</p>
+            <p>优先级数字越小越先用；多个 Key 会自动轮询，遇到 429 会尝试下一个。</p>
           </div>
           <button id="addProviderBtn" class="secondary-btn" type="button">添加 API</button>
         </div>
 
         <label class="field compact">
           <span>默认模型</span>
-          <input id="defaultModel" autocomplete="off" placeholder="gpt-4o-mini" />
+          <input id="defaultModel" autocomplete="off" placeholder="gpt-4o" />
         </label>
 
         <div id="providerList" class="provider-list"></div>
@@ -97,6 +99,34 @@ print(response.choices[0].message.content)</code></pre>
           <p id="saveMessage" class="save-message" role="status"></p>
           <button id="saveBtn" class="primary-btn" type="button">保存配置</button>
         </footer>
+      </section>
+
+      <section class="panel request-panel" aria-label="最近请求">
+        <div class="panel-head">
+          <div>
+            <h2>最近请求</h2>
+            <p>显示最近 50 次后端尝试，方便判断是否发生回退、是否走了流式。</p>
+          </div>
+          <button id="refreshRequestsBtn" class="secondary-btn" type="button">刷新日志</button>
+        </div>
+        <div class="request-table-wrap">
+          <table class="request-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>API</th>
+                <th>状态</th>
+                <th>耗时</th>
+                <th>回退</th>
+                <th>模式</th>
+                <th>错误</th>
+              </tr>
+            </thead>
+            <tbody id="requestLogBody">
+              <tr><td colspan="7" class="empty-cell">暂无请求记录</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </main>
 
@@ -132,14 +162,14 @@ print(response.choices[0].message.content)</code></pre>
           <label class="field">
             <span>模型</span>
             <div class="model-input-row">
-              <input data-field="model" autocomplete="off" placeholder="gpt-3.5-turbo" />
+              <input data-field="model" autocomplete="off" placeholder="点击获取模型后选择" />
               <button class="secondary-btn fetch-models" type="button">获取模型</button>
             </div>
             <div class="model-dropdown" hidden></div>
           </label>
           <label class="field">
-            <span>API Key</span>
-            <input data-field="api_key" type="password" autocomplete="new-password" placeholder="留空保留旧密钥" />
+            <span>API Keys <small>每行一个；留空保存会保留旧密钥</small></span>
+            <textarea data-field="api_keys_text" autocomplete="new-password" spellcheck="false" placeholder="sk-xxxx&#10;sk-yyyy"></textarea>
           </label>
         </div>
 
@@ -147,12 +177,16 @@ print(response.choices[0].message.content)</code></pre>
           <summary>高级选项</summary>
           <div class="advanced-body">
             <label class="field checkbox-field">
-              <span>使用 curl 传输 <small>(Cloudflare 站点选此项)</small></span>
+              <span>启用该 API</span>
+              <input data-field="enabled" type="checkbox" />
+            </label>
+            <label class="field checkbox-field">
+              <span>使用 curl 传输 <small>Cloudflare 站点可尝试开启</small></span>
               <input data-field="use_curl" type="checkbox" />
             </label>
             <div class="aliases-section">
               <div class="aliases-head">
-                <span>模型别名 <small>(你的软件发左边的名，代理转成右边)</small></span>
+                <span>模型别名 <small>左边是客户端请求名，右边是实际发送名</small></span>
                 <button class="ghost-btn add-alias" type="button">+ 添加</button>
               </div>
               <div class="alias-list"></div>

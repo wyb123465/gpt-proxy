@@ -5,7 +5,12 @@
       "base_url": "https://api.example.com/v1",
       "model": "mimo-v2.5",
       "priority": 0,
+      "enabled": true,
       "api_key": "sk-your-api-key",
+      "api_keys": [
+        "sk-your-api-key",
+        "sk-your-second-api-key"
+      ],
       "use_curl": false,
       "model_aliases": {
         "gpt-4o": "mimo-v2.5"
