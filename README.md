@@ -1,6 +1,6 @@
 # Local GPT API Proxy
 
-这是一个本地 OpenAI 兼容代理。你的程序只需要调用本地地址，代理会按 `priority` 从高质量 API 到免费 API 依次尝试，遇到额度耗尽或后端错误时自动切换下一个。
+这是一个本地 OpenAI 兼容代理。你的程序只需要调用本地地址，代理会按优先级自动尝试多个后端 API，并在额度耗尽或后端错误时回退到下一个 Key 或 provider。
 
 ## 已支持能力
 
@@ -12,7 +12,7 @@
 - 多 Key 轮询：同一个 provider 可配置多个 API Key，成功后自动轮到下一个
 - 429 冷却：某个 Key 触发 429 后会暂时跳过它
 - Provider 启停：临时不用某个 API 时无需删除
-- 请求日志：UI 显示最近请求的 provider、状态码、耗时、回退次数、流式状态
+- 请求日志：UI 显示最近请求的 provider、状态码、耗时、回退次数和流式状态
 - 模型别名：客户端请求 `gpt-4o`，后端可转成真实模型名，例如 `mimo-v2.5`
 - 可选安全：代理访问密钥、本地限流、请求体大小限制、配置密钥加密
 - 配置导入/导出：方便备份和迁移
@@ -54,7 +54,7 @@ $env:GPT_PROXY_CONFIG_SECRET="your-config-encryption-passphrase"
 - `GPT_PROXY_RATE_LIMIT_PER_MINUTE`：本地代理每分钟请求限制，`0` 表示关闭。
 - `GPT_PROXY_MAX_REQUEST_BYTES`：请求体大小限制，默认 `2 MB`。
 - `GPT_PROXY_KEY_COOLDOWN_SECONDS`：Key 返回 `429` 后冷却秒数。
-- `GPT_PROXY_CONFIG_SECRET`：启用后写入 `config.json` 的 API Key 会加密保存。
+- `GPT_PROXY_CONFIG_SECRET`：启用后写入 `config.json` 的 API Key 会加密保存；忘记设置该值时无法读取已加密配置。
 
 ## 在 UI 中配置 API
 
@@ -108,6 +108,8 @@ Invoke-WebRequest http://127.0.0.1:8000/api/requests -UseBasicParsing
 Invoke-WebRequest http://127.0.0.1:8000/v1/models -UseBasicParsing
 ```
 
+如果启用了 `GPT_PROXY_ACCESS_TOKEN`，这些请求也需要带本地代理访问密钥。
+
 ## 配置文件
 
 本地真实配置写在 `config.json`，它已被 `.gitignore` 忽略，不会上传密钥。公开模板是 `config.example.json`。
@@ -134,14 +136,25 @@ Invoke-WebRequest http://127.0.0.1:8000/v1/models -UseBasicParsing
 
 ## Docker
 
+首次使用建议先创建空文件，避免 Docker 把挂载目标当成目录：
+
+```powershell
+if (!(Test-Path .\config.json)) { Copy-Item .\config.example.json .\config.json }
+if (!(Test-Path .\state.json)) { Set-Content .\state.json "{}" -Encoding UTF8 }
+Copy-Item .\.env.example .\.env
+```
+
+然后启动：
+
 ```powershell
 docker compose up --build -d
 ```
 
-Docker 启动后同样打开 `http://127.0.0.1:8000/` 配置。
+Docker 启动后打开 `http://127.0.0.1:8000/` 配置。`docker-compose.yml` 会把 `config.json` 和 `state.json` 挂载为可写文件，因此 UI 保存配置、导入配置和调用统计都能正常持久化。
 
 ## 测试
 
 ```powershell
+$env:UV_CACHE_DIR="C:\Users\lenovo\Desktop\zhongzhuan\gpt-proxy\.uv-cache"
 uv run python -m pytest -q -p no:cacheprovider
 ```

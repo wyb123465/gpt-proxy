@@ -5,10 +5,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      FREE_GPT_1_KEY: ${FREE_GPT_1_KEY:-}
-      FREE_GPT_2_KEY: ${FREE_GPT_2_KEY:-}
+      GPT_PROXY_ACCESS_TOKEN: ${GPT_PROXY_ACCESS_TOKEN:-}
+      GPT_PROXY_CONFIG_SECRET: ${GPT_PROXY_CONFIG_SECRET:-}
+      GPT_PROXY_RATE_LIMIT_PER_MINUTE: ${GPT_PROXY_RATE_LIMIT_PER_MINUTE:-0}
+      GPT_PROXY_MAX_REQUEST_BYTES: ${GPT_PROXY_MAX_REQUEST_BYTES:-2097152}
+      GPT_PROXY_KEY_COOLDOWN_SECONDS: ${GPT_PROXY_KEY_COOLDOWN_SECONDS:-60}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ./config.json:/app/config.json
       - ./state.json:/app/state.json

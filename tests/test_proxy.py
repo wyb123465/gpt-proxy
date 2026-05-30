@@ -695,7 +695,43 @@ def test_responses_endpoint_returns_response_shape(tmp_path, monkeypatch):
     assert data["output"][0]["content"][0]["text"] == "hi"
 
 
-def test_config_export_and_import_roundtrip(tmp_path, monkeypatch):
+def test_responses_streaming_returns_sse_events(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0)])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    sse_body = (
+        b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":" world"}}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+
+    def handler(request):
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("stream"):
+            return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Hello world"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1/responses", json={"model": "gpt-4o", "input": "hi", "stream": True})
+
+    assert response.status_code == 200
+    text = response.text
+    assert "event: response.created" in text
+    assert "event: response.output_text.delta" in text
+    assert "Hello" in text
+    assert "world" in text
+    assert "event: response.completed" in text
+    assert "Hello world" in text
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"
     original = [make_provider("official", 0, api_key="secret-key")]

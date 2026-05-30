@@ -1,0 +1,761 @@
+import asyncio
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from ._config import (
+    apply_env_overrides,
+    chat_to_responses_payload,
+    decrypt_config,
+    editable_provider,
+    encrypt_config,
+    normalize_config_payload,
+    provider_api_keys,
+    read_json_file,
+    responses_input_to_messages,
+    write_json_file,
+)
+from ._providers import (
+    build_forward_headers,
+    build_request_body,
+    check_provider,
+    curl_forward_to_provider,
+    curl_stream_request,
+    fetch_provider_models,
+    forward_to_provider,
+    safe_response_detail,
+    should_use_curl,
+)
+from ._state import key_fingerprint, request_log_entry
+
+# ---------------------------------------------------------------------------
+# Monkeypatchable module-level constants
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "static"
+CONFIG_PATH = Path(os.getenv("GPT_PROXY_CONFIG", BASE_DIR / "config.json"))
+STATE_PATH = Path(os.getenv("GPT_PROXY_STATE", BASE_DIR / "state.json"))
+RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
+REQUEST_LOG_LIMIT = 50
+PROXY_ACCESS_TOKEN = os.getenv("GPT_PROXY_ACCESS_TOKEN", "").strip()
+CONFIG_ENCRYPTION_SECRET = os.getenv("GPT_PROXY_CONFIG_SECRET", "").strip()
+RATE_LIMIT_PER_MINUTE = int(os.getenv("GPT_PROXY_RATE_LIMIT_PER_MINUTE", "0") or 0)
+MAX_REQUEST_BYTES = int(os.getenv("GPT_PROXY_MAX_REQUEST_BYTES", str(2 * 1024 * 1024)) or 0)
+KEY_COOLDOWN_SECONDS = int(os.getenv("GPT_PROXY_KEY_COOLDOWN_SECONDS", "60") or 0)
+RATE_LIMIT_BUCKETS: dict[str, list[float]] = {}
+_state_cache: dict[str, Any] | None = None
+_state_cache_path: Path | None = None
+_state_write_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format="[%(asctime)s] %(levelname)s %(message)s",
+)
+logger = logging.getLogger("gpt_proxy")
+
+# ---------------------------------------------------------------------------
+# HTTP client helpers (monkeypatchable)
+# ---------------------------------------------------------------------------
+
+def create_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=30.0)
+
+
+_original_create_http_client = create_http_client
+
+
+def get_http_client(application: FastAPI) -> httpx.AsyncClient:
+    if create_http_client is not _original_create_http_client:
+        return create_http_client()
+    if not hasattr(application.state, "http_client") or application.state.http_client is None:
+        application.state.http_client = create_http_client()
+    return application.state.http_client
+
+# ---------------------------------------------------------------------------
+# State management
+# ---------------------------------------------------------------------------
+
+async def _periodic_state_flush() -> None:
+    while True:
+        await asyncio.sleep(5)
+        flush_state_cache()
+
+
+def flush_state_cache() -> None:
+    global _state_cache
+    if _state_cache is not None:
+        with _state_write_lock:
+            write_json_file(STATE_PATH, _state_cache)
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    task = asyncio.create_task(_periodic_state_flush())
+    yield
+    task.cancel()
+    flush_state_cache()
+    client = getattr(application.state, "http_client", None)
+    if client is not None:
+        await client.aclose()
+
+
+def load_state() -> dict[str, Any]:
+    global _state_cache, _state_cache_path
+    if _state_cache is None or _state_cache_path != STATE_PATH:
+        _state_cache = read_json_file(STATE_PATH, {})
+        _state_cache_path = STATE_PATH
+    return _state_cache
+
+
+def save_state(state: dict[str, Any]) -> None:
+    global _state_cache, _state_cache_path
+    _state_cache = state
+    _state_cache_path = STATE_PATH
+    with _state_write_lock:
+        write_json_file(STATE_PATH, state)
+
+
+def record_key_cooldown(provider_name: str, api_key: str) -> None:
+    if KEY_COOLDOWN_SECONDS <= 0:
+        return
+    state = load_state()
+    provider_state = state.setdefault(provider_name, {"calls": 0, "last_remaining": None})
+    cooldowns = provider_state.setdefault("key_cooldowns", {})
+    cooldowns[key_fingerprint(api_key)] = time.time() + KEY_COOLDOWN_SECONDS
+    save_state(state)
+
+
+def key_attempt_order(provider: dict[str, Any], state: dict[str, Any]) -> list[tuple[int, str]]:
+    keys = provider_api_keys(provider)
+    if not keys:
+        return []
+    provider_state = state.get(provider["name"], {})
+    start_index = int(provider_state.get("key_index", 0)) % len(keys)
+    ordered_indexes = list(range(start_index, len(keys))) + list(range(0, start_index))
+    cooldowns = provider_state.get("key_cooldowns", {})
+    now = time.time()
+    available = []
+    cooled = []
+    for index in ordered_indexes:
+        key = keys[index]
+        if float(cooldowns.get(key_fingerprint(key), 0) or 0) > now:
+            cooled.append((index, key))
+        else:
+            available.append((index, key))
+    return available or cooled
+
+
+def record_success(
+    provider_name: str,
+    response: httpx.Response,
+    key_count: int = 1,
+    key_index: int | None = None,
+) -> None:
+    state = load_state()
+    provider_state = state.setdefault(provider_name, {"calls": 0, "last_remaining": None})
+    provider_state["calls"] = int(provider_state.get("calls", 0)) + 1
+    if key_index is not None and key_count > 0:
+        provider_state["key_index"] = (key_index + 1) % key_count
+    remaining = response.headers.get("x-ratelimit-remaining")
+    if remaining is not None:
+        try:
+            provider_state["last_remaining"] = int(remaining)
+        except ValueError:
+            provider_state["last_remaining"] = remaining
+    save_state(state)
+
+
+def append_request_log(entry: dict[str, Any]) -> None:
+    state = load_state()
+    requests = state.setdefault("_requests", [])
+    requests.insert(0, entry)
+    del requests[REQUEST_LOG_LIMIT:]
+    save_state(state)
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def write_config_file(config: dict[str, Any]) -> None:
+    write_json_file(CONFIG_PATH, encrypt_config(config))
+
+
+def load_raw_config() -> dict[str, Any]:
+    config = decrypt_config(read_json_file(CONFIG_PATH, {"providers": [], "default_model": "gpt-3.5-turbo"}))
+    config.setdefault("providers", [])
+    config.setdefault("default_model", "gpt-3.5-turbo")
+    return config
+
+
+def load_config() -> dict[str, Any]:
+    config = load_raw_config()
+    providers = [apply_env_overrides(provider) for provider in config.get("providers", [])]
+    providers = [
+        provider
+        for provider in providers
+        if provider.get("enabled", True)
+        and provider.get("name")
+        and provider.get("base_url")
+        and provider_api_keys(provider)
+    ]
+    config["providers"] = sorted(providers, key=lambda item: item.get("priority", 1000))
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Auth / rate-limit
+# ---------------------------------------------------------------------------
+
+def require_proxy_access(request: Request) -> None:
+    if not PROXY_ACCESS_TOKEN:
+        return
+    auth_header = request.headers.get("authorization", "")
+    x_api_key = request.headers.get("x-api-key", "")
+    if auth_header == f"Bearer {PROXY_ACCESS_TOKEN}" or x_api_key == PROXY_ACCESS_TOKEN:
+        return
+    raise HTTPException(status_code=401, detail="Missing or invalid local proxy access token")
+
+
+def enforce_rate_limit(request: Request) -> None:
+    if RATE_LIMIT_PER_MINUTE <= 0:
+        return
+    client_host = request.client.host if request.client else "local"
+    identity = request.headers.get("authorization") or request.headers.get("x-api-key") or client_host
+    now = time.time()
+    window_start = now - 60
+
+    stale_threshold = now - 120
+    stale_keys = [k for k, v in RATE_LIMIT_BUCKETS.items() if not v or v[-1] < stale_threshold]
+    for k in stale_keys:
+        del RATE_LIMIT_BUCKETS[k]
+
+    bucket = [timestamp for timestamp in RATE_LIMIT_BUCKETS.get(identity, []) if timestamp > window_start]
+    if len(bucket) >= RATE_LIMIT_PER_MINUTE:
+        RATE_LIMIT_BUCKETS[identity] = bucket
+        raise HTTPException(status_code=429, detail="Local proxy rate limit exceeded")
+    bucket.append(now)
+    RATE_LIMIT_BUCKETS[identity] = bucket
+
+
+async def read_v1_json_body(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    enforce_rate_limit(request)
+    raw = await request.body()
+    if MAX_REQUEST_BYTES > 0 and len(raw) > MAX_REQUEST_BYTES:
+        raise HTTPException(status_code=413, detail="Request body is too large")
+    try:
+        return json.loads(raw.decode("utf-8")) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
+
+
+# ---------------------------------------------------------------------------
+# Proxy core logic
+# ---------------------------------------------------------------------------
+
+async def stream_response_bytes(
+    response: httpx.Response,
+    client: httpx.AsyncClient,
+    log_entry: dict[str, Any] | None = None,
+) -> AsyncIterator[bytes]:
+    status = "stream_complete"
+    error = None
+    try:
+        async for chunk in response.aiter_bytes():
+            if chunk:
+                yield chunk
+    except Exception as exc:
+        status = "stream_error"
+        error = str(exc)
+        raise
+    finally:
+        if log_entry:
+            log_entry["stream_status"] = status
+            if error:
+                log_entry["error"] = error
+            append_request_log(log_entry)
+        await response.aclose()
+
+
+async def _try_provider(
+    client: httpx.AsyncClient,
+    body: dict[str, Any],
+    provider: dict[str, Any],
+    default_model: str,
+    api_key: str,
+    stream: bool,
+) -> tuple[str, Any]:
+    if should_use_curl(provider):
+        if stream:
+            url = f"{provider['base_url'].rstrip('/')}/chat/completions"
+            headers = build_forward_headers(api_key)
+            request_body = build_request_body(body, provider, default_model)
+            return ("curl_stream", curl_stream_request(url, headers, request_body))
+        try:
+            status_code, data = await curl_forward_to_provider(body, provider, default_model, api_key)
+        except Exception:
+            raise
+        if status_code == 200:
+            return ("curl", data)
+        if status_code in RETRYABLE_STATUS_CODES:
+            return ("retryable", {"status": status_code, "detail": json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)})
+        raise HTTPException(status_code=status_code, detail=data)
+
+    try:
+        if stream:
+            url = f"{provider['base_url'].rstrip('/')}/chat/completions"
+            headers = build_forward_headers(api_key)
+            request_body = build_request_body(body, provider, default_model)
+            upstream_request = client.build_request("POST", url, headers=headers, json=request_body)
+            response = await client.send(upstream_request, stream=True)
+        else:
+            response = await forward_to_provider(client, body, provider, default_model, api_key)
+    except httpx.RequestError:
+        raise
+
+    if response.status_code == 200:
+        return ("response", response)
+    if stream:
+        error_bytes = await response.aread()
+        await response.aclose()
+        error_text = error_bytes.decode("utf-8", errors="replace")
+    else:
+        error_text = response.text
+    if response.status_code in RETRYABLE_STATUS_CODES:
+        return ("retryable", {"status": response.status_code, "detail": error_text})
+    if stream:
+        raise HTTPException(status_code=response.status_code, detail=error_text)
+    return ("fatal_response", JSONResponse(content=safe_response_detail(response), status_code=response.status_code))
+
+
+async def _iterate_providers(
+    body: dict[str, Any],
+    config: dict[str, Any],
+    client: httpx.AsyncClient,
+    callback: Any,
+    stream: bool,
+    path: str = "/v1/chat/completions",
+) -> Any:
+    last_error = "所有后端 API 均不可用"
+    fallback_count = 0
+    state = load_state()
+
+    for provider in config["providers"]:
+        provider_name = provider["name"]
+        key_attempts = key_attempt_order(provider, state)
+        for key_index, api_key in key_attempts:
+            started_at = time.perf_counter()
+            try:
+                kind, data = await _try_provider(client, body, provider, config["default_model"], api_key, stream)
+            except httpx.RequestError as exc:
+                logger.info("provider=%s status=request_error path=%s", provider_name, path)
+                last_error = str(exc)
+                append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error, streamed=stream, path=path))
+                fallback_count += 1
+                continue
+            except HTTPException as exc:
+                logger.info("provider=%s status=%s path=%s", provider_name, exc.status_code, path)
+                append_request_log(request_log_entry(provider_name, exc.status_code, started_at, fallback_count, streamed=stream, path=path))
+                raise
+
+            if kind == "retryable":
+                retry_info = data
+                logger.info("provider=%s status=%s path=%s", provider_name, retry_info["status"], path)
+                append_request_log(request_log_entry(provider_name, retry_info["status"], started_at, fallback_count, retry_info["detail"], streamed=stream, path=path))
+                if retry_info["status"] == 429:
+                    record_key_cooldown(provider_name, api_key)
+                last_error = retry_info["detail"]
+                fallback_count += 1
+                continue
+
+            if kind == "fatal_response":
+                return data
+
+            logger.info("provider=%s status=200 path=%s", provider_name, path)
+            if kind == "response":
+                record_success(provider_name, data, len(key_attempts), key_index)
+            else:
+                record_success(provider_name, httpx.Response(200, json={}), len(key_attempts), key_index)
+            return callback(data, provider_name, started_at, fallback_count, key_attempts, key_index, client, stream, path)
+
+    raise HTTPException(status_code=502, detail=last_error)
+
+
+def _stream_callback(
+    data: Any,
+    provider_name: str,
+    started_at: float,
+    fallback_count: int,
+    key_attempts: list,
+    key_index: int,
+    client: httpx.AsyncClient,
+    stream: bool,
+    path: str,
+) -> StreamingResponse:
+    if isinstance(data, httpx.Response):
+        log_entry = request_log_entry(provider_name, data.status_code, started_at, fallback_count, streamed=True, path=path)
+        return StreamingResponse(
+            stream_response_bytes(data, client, log_entry),
+            media_type=data.headers.get("content-type", "text/event-stream"),
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    async def _curl_stream_gen(async_iter):
+        async for chunk in async_iter:
+            yield chunk
+
+    if hasattr(data, "__aiter__"):
+        log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path)
+        log_entry["stream_status"] = "stream_complete"
+        append_request_log(log_entry)
+        return StreamingResponse(_curl_stream_gen(data), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path)
+    log_entry["stream_status"] = "stream_complete"
+    append_request_log(log_entry)
+    payload = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
+    return StreamingResponse(iter([payload.encode("utf-8")]), media_type="text/event-stream")
+
+
+def _json_callback(
+    data: Any,
+    provider_name: str,
+    started_at: float,
+    fallback_count: int,
+    key_attempts: list,
+    key_index: int,
+    client: httpx.AsyncClient,
+    stream: bool,
+    path: str,
+) -> JSONResponse:
+    append_request_log(request_log_entry(provider_name, 200, started_at, fallback_count, path=path))
+    content = data.json() if isinstance(data, httpx.Response) else data
+    return JSONResponse(content=content, status_code=200)
+
+
+async def stream_chat_completions(
+    body: dict[str, Any],
+    config: dict[str, Any],
+    request: Request | None = None,
+    path: str = "/v1/chat/completions",
+) -> StreamingResponse:
+    client = get_http_client(request.app) if request else create_http_client()
+    return await _iterate_providers(body, config, client, _stream_callback, stream=True, path=path)
+
+
+async def proxy_chat_json(
+    body: dict[str, Any],
+    config: dict[str, Any],
+    request: Request | None = None,
+    path: str = "/v1/chat/completions",
+) -> JSONResponse:
+    client = get_http_client(request.app) if request else create_http_client()
+    return await _iterate_providers(body, config, client, _json_callback, stream=False, path=path)
+
+
+# ---------------------------------------------------------------------------
+# Responses API SSE
+# ---------------------------------------------------------------------------
+
+def _sse_event(event_type: str, data: dict[str, Any]) -> bytes:
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+async def stream_responses_events(
+    body: dict[str, Any],
+    config: dict[str, Any],
+    request: Request,
+) -> StreamingResponse:
+    response_id = f"resp_{uuid.uuid4().hex}"
+    model = body.get("model", config["default_model"])
+    accumulated_text = ""
+
+    async def generate():
+        nonlocal accumulated_text
+        yield _sse_event("response.created", {
+            "type": "response.created",
+            "response": {"id": response_id, "object": "response", "model": model, "status": "in_progress"},
+        })
+
+        client = get_http_client(request.app)
+        last_error = "所有后端 API 均不可用"
+        state = load_state()
+
+        for provider in config["providers"]:
+            provider_name = provider["name"]
+            key_attempts = key_attempt_order(provider, state)
+            for key_index, api_key in key_attempts:
+                try:
+                    kind, data = await _try_provider(client, body, provider, config["default_model"], api_key, stream=True)
+                except (httpx.RequestError, HTTPException):
+                    continue
+
+                if kind == "retryable":
+                    if data["status"] == 429:
+                        record_key_cooldown(provider_name, api_key)
+                    last_error = data["detail"]
+                    continue
+
+                record_success(provider_name, httpx.Response(200, json={}), len(key_attempts), key_index)
+
+                if kind == "response":
+                    try:
+                        async for chunk_bytes in data.aiter_bytes():
+                            for line in chunk_bytes.decode("utf-8", errors="replace").split("\n"):
+                                if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                                    try:
+                                        delta = json.loads(line[6:])
+                                        text = delta.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                        if text:
+                                            accumulated_text += text
+                                            yield _sse_event("response.output_text.delta", {
+                                                "type": "response.output_text.delta", "delta": text,
+                                            })
+                                    except (json.JSONDecodeError, IndexError):
+                                        pass
+                    finally:
+                        await data.aclose()
+                elif kind == "curl_stream":
+                    buffer = ""
+                    async for chunk_bytes in data:
+                        buffer += chunk_bytes.decode("utf-8", errors="replace")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                                try:
+                                    delta = json.loads(line[6:])
+                                    text = delta.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                    if text:
+                                        accumulated_text += text
+                                        yield _sse_event("response.output_text.delta", {
+                                            "type": "response.output_text.delta", "delta": text,
+                                        })
+                                except (json.JSONDecodeError, IndexError):
+                                    pass
+                elif kind == "curl":
+                    payload_text = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
+                    accumulated_text = payload_text
+
+                final_payload = chat_to_responses_payload(
+                    {"model": model, "choices": [{"message": {"content": accumulated_text}}]}, model,
+                )
+                yield _sse_event("response.completed", {"type": "response.completed", "response": final_payload})
+                return
+
+        raise HTTPException(status_code=502, detail=last_error)
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# App & routes
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Local GPT API Proxy", lifespan=lifespan)
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/")
+def dashboard() -> FileResponse:
+    index_path = STATIC_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Dashboard files are missing")
+    return FileResponse(index_path)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    body = await read_v1_json_body(request)
+    config = load_config()
+    if not config["providers"]:
+        raise HTTPException(status_code=500, detail="No usable providers configured")
+    if body.get("stream") is True:
+        return await stream_chat_completions(body, config, request=request)
+    return await proxy_chat_json(body, config, request=request)
+
+
+@app.post("/v1/responses")
+async def responses(request: Request):
+    payload = await read_v1_json_body(request)
+    config = load_config()
+    if not config["providers"]:
+        raise HTTPException(status_code=500, detail="No usable providers configured")
+
+    chat_body = {
+        "model": payload.get("model", config["default_model"]),
+        "messages": responses_input_to_messages(payload),
+    }
+    for key in ("temperature", "top_p", "max_tokens", "max_completion_tokens", "stream"):
+        if key in payload:
+            chat_body[key] = payload[key]
+
+    if chat_body.get("stream") is True:
+        return await stream_responses_events(chat_body, config, request)
+
+    chat_response = await proxy_chat_json(chat_body, config, request=request, path="/v1/responses")
+    if chat_response.status_code != 200:
+        return chat_response
+    chat_data = json.loads(chat_response.body.decode("utf-8"))
+    return JSONResponse(content=chat_to_responses_payload(chat_data, payload.get("model")), status_code=200)
+
+
+@app.get("/v1/models")
+async def list_models(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    enforce_rate_limit(request)
+    config = load_config()
+    seen = set()
+    models = []
+    for provider in config["providers"]:
+        provider_models = await fetch_provider_models(provider)
+        if not provider_models and provider.get("model"):
+            provider_models = [{"id": provider["model"], "object": "model"}]
+        for model in provider_models:
+            model_id = model["id"]
+            if model_id in seen:
+                continue
+            seen.add(model_id)
+            item = dict(model)
+            item.setdefault("object", "model")
+            item["owned_by"] = item.get("owned_by") or provider["name"]
+            models.append(item)
+    return {"object": "list", "data": models}
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/config")
+def get_config(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_raw_config()
+    state = load_state()
+    return {
+        "default_model": config.get("default_model", "gpt-3.5-turbo"),
+        "providers": [
+            editable_provider(provider, state, config.get("default_model", "gpt-3.5-turbo"))
+            for provider in sorted(config.get("providers", []), key=lambda item: item.get("priority", 1000))
+        ],
+        "security": {
+            "proxy_access_token_enabled": bool(PROXY_ACCESS_TOKEN),
+            "config_encryption_enabled": bool(CONFIG_ENCRYPTION_SECRET),
+            "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
+            "max_request_bytes": MAX_REQUEST_BYTES,
+            "key_cooldown_seconds": KEY_COOLDOWN_SECONDS,
+        },
+    }
+
+
+@app.post("/api/config")
+async def save_config(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    try:
+        payload = await request.json()
+        config = normalize_config_payload(payload, load_raw_config())
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_config_file(config)
+    return get_config(request)
+
+
+@app.get("/api/config/export")
+def export_config(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    return load_raw_config()
+
+
+@app.post("/api/config/import")
+async def import_config(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    try:
+        payload = await request.json()
+        config = normalize_config_payload(payload, {"providers": []})
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_config_file(config)
+    return get_config(request)
+
+
+@app.get("/api/providers")
+def provider_status(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_config()
+    state = load_state()
+    providers = []
+    for provider in config["providers"]:
+        providers.append(
+            {
+                "name": provider["name"],
+                "base_url": provider["base_url"],
+                "model": provider.get("model", config["default_model"]),
+                "priority": provider.get("priority", 1000),
+                "enabled": provider.get("enabled", True),
+                "key_count": len(provider_api_keys(provider)),
+                "calls": state.get(provider["name"], {}).get("calls", 0),
+                "last_remaining": state.get(provider["name"], {}).get("last_remaining"),
+            }
+        )
+    return {"providers": providers}
+
+
+@app.get("/api/requests")
+def recent_requests(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    state = load_state()
+    return {"requests": state.get("_requests", [])[:REQUEST_LOG_LIMIT]}
+
+
+@app.post("/api/providers/{provider_name}/check")
+async def provider_check(provider_name: str, request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_config()
+    raw_config = load_raw_config()
+    raw_names = {provider.get("name") for provider in raw_config.get("providers", []) if provider.get("name")}
+    for provider in config["providers"]:
+        if provider["name"] == provider_name:
+            result = await check_provider(provider, config["default_model"])
+            return {"provider": provider_name, **result}
+    if provider_name in raw_names:
+        return {
+            "provider": provider_name,
+            "ok": False,
+            "status": "no_api_key",
+            "detail": "该 API 尚未启用或尚未填写密钥，请先在 UI 中启用并输入 API Key 后保存",
+        }
+    raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' does not exist in config")
+
+
+@app.get("/api/providers/{provider_name}/models")
+async def provider_models_endpoint(provider_name: str, request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_config()
+    for provider in config["providers"]:
+        if provider["name"] == provider_name:
+            models = await fetch_provider_models(provider)
+            return {"provider": provider_name, "status": 200, "models": {"object": "list", "data": models}}
+    raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
