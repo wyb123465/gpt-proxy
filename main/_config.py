@@ -3,8 +3,6 @@ import hashlib
 import json
 import os
 import sys
-import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +112,9 @@ def normalize_provider(provider: dict[str, Any], existing_provider: dict[str, An
     api_key_env = str(provider.get("api_key_env", "")).strip()
     use_curl = bool(provider.get("use_curl", False))
     enabled = bool(provider.get("enabled", True))
+    protocol = str(provider.get("protocol", "openai")).strip().lower() or "openai"
+    if protocol not in {"openai", "domestic", "claude", "gemini"}:
+        raise ValueError(f"Provider '{name}' protocol must be one of openai/domestic/claude/gemini")
     model_aliases = provider.get("model_aliases") or {}
     if not isinstance(model_aliases, dict):
         model_aliases = {}
@@ -135,6 +136,9 @@ def normalize_provider(provider: dict[str, Any], existing_provider: dict[str, An
         "priority": priority,
         "enabled": enabled,
     }
+
+    if protocol != "openai":
+        normalized["protocol"] = protocol
 
     keys = []
     api_keys = provider.get("api_keys")
@@ -198,6 +202,7 @@ def editable_provider(provider: dict[str, Any], state: dict[str, Any], default_m
         "base_url": provider.get("base_url", ""),
         "model": provider.get("model", default_model),
         "priority": provider.get("priority", 1000),
+        "protocol": provider.get("protocol", "openai"),
         "api_key": "",
         "api_keys": [],
         "api_key_env": provider.get("api_key_env", ""),
@@ -210,45 +215,3 @@ def editable_provider(provider: dict[str, Any], state: dict[str, Any], default_m
         "last_remaining": provider_state.get("last_remaining"),
     }
 
-
-def response_text_from_chat(chat_data: dict[str, Any]) -> str:
-    try:
-        return chat_data.get("choices", [{}])[0].get("message", {}).get("content") or ""
-    except (AttributeError, IndexError):
-        return ""
-
-
-def responses_input_to_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    input_value = payload.get("input", "")
-    if isinstance(input_value, str):
-        return [{"role": "user", "content": input_value}]
-    if isinstance(input_value, list):
-        messages = []
-        for item in input_value:
-            if isinstance(item, dict) and item.get("role") and "content" in item:
-                messages.append({"role": item["role"], "content": item["content"]})
-            else:
-                messages.append({"role": "user", "content": json.dumps(item, ensure_ascii=False)})
-        return messages or [{"role": "user", "content": ""}]
-    return [{"role": "user", "content": json.dumps(input_value, ensure_ascii=False)}]
-
-
-def chat_to_responses_payload(chat_data: dict[str, Any], requested_model: str | None) -> dict[str, Any]:
-    text = response_text_from_chat(chat_data)
-    model = chat_data.get("model") or requested_model or ""
-    return {
-        "id": f"resp_{uuid.uuid4().hex}",
-        "object": "response",
-        "created_at": int(time.time()),
-        "model": model,
-        "output": [
-            {
-                "id": f"msg_{uuid.uuid4().hex}",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
-            }
-        ],
-        "output_text": text,
-        "usage": chat_data.get("usage"),
-    }

@@ -674,10 +674,16 @@ def test_responses_endpoint_returns_response_shape(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "CONFIG_PATH", config_path)
     monkeypatch.setattr(main, "STATE_PATH", state_path)
 
+    seen = {}
+
     def handler(request):
-        body = json.loads(request.content.decode("utf-8"))
-        assert body["messages"] == [{"role": "user", "content": "hello"}]
-        return httpx.Response(200, json={"model": "default-model", "choices": [{"message": {"content": "hi"}}]})
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        # backend speaks the native Responses API; proxy passes it through verbatim
+        return httpx.Response(200, json={
+            "id": "resp_1", "object": "response", "output_text": "hi",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+        })
 
     monkeypatch.setattr(
         main,
@@ -689,6 +695,10 @@ def test_responses_endpoint_returns_response_shape(tmp_path, monkeypatch):
     response = client.post("/v1/responses", json={"model": "gpt-4o", "input": "hello"})
 
     assert response.status_code == 200
+    # request was passed through to {base}/responses with the raw body (input preserved)
+    assert seen["url"].endswith("/responses")
+    assert seen["body"]["input"] == "hello"
+    # response returned verbatim
     data = response.json()
     assert data["object"] == "response"
     assert data["output_text"] == "hi"
@@ -703,17 +713,18 @@ def test_responses_streaming_returns_sse_events(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "CONFIG_PATH", config_path)
     monkeypatch.setattr(main, "STATE_PATH", state_path)
 
+    # native Responses API SSE bytes — proxy must pass these through unchanged
     sse_body = (
-        b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n'
-        b'data: {"choices":[{"delta":{"content":" world"}}]}\n\n'
-        b'data: [DONE]\n\n'
+        b'event: response.created\ndata: {"type":"response.created"}\n\n'
+        b'event: response.output_text.delta\ndata: {"delta":"Hello"}\n\n'
+        b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
     )
 
     def handler(request):
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("stream"):
-            return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
-        return httpx.Response(200, json={"choices": [{"message": {"content": "Hello world"}}]})
+        assert str(request.url).endswith("/responses")
+        assert body["input"] == "hi"
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
 
     monkeypatch.setattr(
         main,
@@ -722,16 +733,18 @@ def test_responses_streaming_returns_sse_events(tmp_path, monkeypatch):
     )
 
     client = TestClient(main.app)
-    response = client.post("/v1/responses", json={"model": "gpt-4o", "input": "hi", "stream": True})
+    with client.stream("POST", "/v1/responses", json={"model": "gpt-4o", "input": "hi", "stream": True}) as response:
+        text = response.read().decode("utf-8")
 
     assert response.status_code == 200
-    text = response.text
+    # SSE bytes passed through verbatim
     assert "event: response.created" in text
     assert "event: response.output_text.delta" in text
     assert "Hello" in text
-    assert "world" in text
     assert "event: response.completed" in text
-    assert "Hello world" in text
+
+
+def test_config_export_and_import_roundtrip(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"
     original = [make_provider("official", 0, api_key="secret-key")]
@@ -850,3 +863,275 @@ def test_encrypted_config_requires_secret(tmp_path, monkeypatch):
         assert "GPT_PROXY_CONFIG_SECRET" in str(exc)
     else:
         raise AssertionError("Encrypted config loaded without GPT_PROXY_CONFIG_SECRET")
+
+
+def test_claude_protocol_uses_correct_headers(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "claude",
+                "protocol": "claude",
+                "base_url": "https://api.anthropic.com/v1",
+                "model": "claude-sonnet-4-20250514",
+                "priority": 0,
+                "api_keys": ["sk-ant-test-key"],
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen_headers = {}
+
+    def handler(request):
+        seen_headers.update(dict(request.headers))
+        return httpx.Response(200, json={"id": "msg_123", "type": "message", "content": [{"type": "text", "text": "Hello"}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1/messages", json={"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 100})
+
+    assert response.status_code == 200
+    assert "x-api-key" in seen_headers
+    assert seen_headers["x-api-key"] == "sk-ant-test-key"
+    assert "anthropic-version" in seen_headers
+
+
+def test_gemini_protocol_routes_correctly(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "gemini",
+                "protocol": "gemini",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                "model": "gemini-2.0-flash",
+                "priority": 0,
+                "api_keys": ["gemini-test-key"],
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen_request = {}
+
+    def handler(request):
+        seen_request["url"] = str(request.url)
+        seen_request["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "Response"}]}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1beta/models/gemini-2.0-flash:generateContent", json={"contents": [{"parts": [{"text": "Hello"}]}]})
+
+    assert response.status_code == 200
+    assert "gemini-2.0-flash:generateContent" in seen_request["url"]
+    assert "x-goog-api-key" in seen_request["headers"]
+    assert seen_request["headers"]["x-goog-api-key"] == "gemini-test-key"
+
+
+def test_domestic_protocol_with_deepseek(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "deepseek",
+                "protocol": "domestic",
+                "base_url": "https://api.deepseek.com/v1",
+                "model": "deepseek-chat",
+                "priority": 0,
+                "api_keys": ["sk-deepseek-test"],
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen_request = {}
+
+    def handler(request):
+        seen_request["url"] = str(request.url)
+        seen_request["headers"] = dict(request.headers)
+        seen_request["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Response from DeepSeek"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1/chat/completions", json={"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]})
+
+    assert response.status_code == 200
+    assert "deepseek.com" in seen_request["url"]
+    assert "authorization" in seen_request["headers"]
+    assert "Bearer sk-deepseek-test" in seen_request["headers"]["authorization"]
+    assert seen_request["body"]["model"] == "deepseek-chat"
+
+
+def test_multiple_protocols_fallback(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "openai",
+                "protocol": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "model": "gpt-4o",
+                "priority": 0,
+                "api_keys": ["sk-openai-test"],
+            },
+            {
+                "name": "deepseek",
+                "protocol": "domestic",
+                "base_url": "https://api.deepseek.com/v1",
+                "model": "deepseek-chat",
+                "priority": 1,
+                "api_keys": ["sk-deepseek-test"],
+            },
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if "openai.com" in str(request.url):
+            return httpx.Response(429, json={"error": "rate_limit_exceeded"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Response from DeepSeek"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/v1/chat/completions", json={"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]})
+
+    assert response.status_code == 200
+    assert len(calls) == 2
+    assert "openai.com" in calls[0]
+    assert "deepseek.com" in calls[1]
+
+
+def test_provider_check_claude_uses_messages_endpoint(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "claude",
+                "protocol": "claude",
+                "base_url": "https://api.anthropic.com/v1",
+                "model": "claude-3-5-sonnet-20241022",
+                "priority": 0,
+                "api_keys": ["claude-test-key"],
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"content": [{"text": "pong"}]})
+
+    class MockAsyncClient(httpx.AsyncClient):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+
+    client = TestClient(main.app)
+    response = client.post("/api/providers/claude/check")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ok"] is True
+    assert data["status"] == 200
+    # Claude check must hit /messages with the x-api-key header, not Bearer auth
+    assert seen["url"].endswith("/messages")
+    assert seen["headers"].get("x-api-key") == "claude-test-key"
+    assert "authorization" not in seen["headers"]
+
+
+def test_provider_check_gemini_uses_generate_content(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "gemini",
+                "protocol": "gemini",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                "model": "gemini-2.0-flash",
+                "priority": 0,
+                "api_keys": ["gemini-test-key"],
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "pong"}]}}]})
+
+    class MockAsyncClient(httpx.AsyncClient):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+
+    client = TestClient(main.app)
+    response = client.post("/api/providers/gemini/check")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ok"] is True
+    assert data["status"] == 200
+    # Gemini check must resolve the model into the URL and use x-goog-api-key
+    assert "gemini-2.0-flash:generateContent" in seen["url"]
+    assert seen["headers"].get("x-goog-api-key") == "gemini-test-key"
+    assert "authorization" not in seen["headers"]

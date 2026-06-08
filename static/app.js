@@ -7,6 +7,8 @@ const usableCount = document.querySelector("#usableCount");
 const totalCalls = document.querySelector("#totalCalls");
 const modelSummary = document.querySelector("#modelSummary");
 const requestLogBody = document.querySelector("#requestLogBody");
+const overviewProviderList = document.querySelector("#overviewProviderList");
+const overviewRequestList = document.querySelector("#overviewRequestList");
 const proxyTokenState = document.querySelector("#proxyTokenState");
 const encryptionState = document.querySelector("#encryptionState");
 const rateLimitState = document.querySelector("#rateLimitState");
@@ -14,13 +16,75 @@ const bodyLimitState = document.querySelector("#bodyLimitState");
 const cooldownState = document.querySelector("#cooldownState");
 const importConfigFile = document.querySelector("#importConfigFile");
 const localProxyTokenInput = document.querySelector("#localProxyToken");
+const saveAndTestBtn = document.querySelector("#saveAndTestBtn");
+const viewKicker = document.querySelector("#viewKicker");
+const viewTitle = document.querySelector("#viewTitle");
+const viewDescription = document.querySelector("#viewDescription");
+const requestStatusFilter = document.querySelector("#requestStatusFilter");
+const requestSearchInput = document.querySelector("#requestSearchInput");
+const viewButtons = Array.from(document.querySelectorAll("[data-view-target]"));
+const viewPanels = Array.from(document.querySelectorAll("[data-view-panel]"));
+const viewJumpButtons = Array.from(document.querySelectorAll("[data-view-jump]"));
 
 let providers = [];
+let latestRequests = [];
 localProxyTokenInput.value = localStorage.getItem("gpt_proxy_access_token") || "";
+
+const viewCopy = {
+  overview: {
+    kicker: "Overview",
+    title: "总览",
+    description: "查看本地代理状态、当前 API 和最近请求。",
+  },
+  providers: {
+    kicker: "Providers",
+    title: "API 配置",
+    description: "维护 provider、优先级、多 key 轮询、模型别名和连通性测试。",
+  },
+  usage: {
+    kicker: "Client setup",
+    title: "调用方式",
+    description: "复制统一 Base URL，并把其他客户端指向这个本地代理。",
+  },
+  requests: {
+    kicker: "Request logs",
+    title: "请求日志",
+    description: "查看最近请求的 provider、状态码、耗时、回退次数和流式状态。",
+  },
+  security: {
+    kicker: "Security",
+    title: "安全设置",
+    description: "查看本地访问 token、配置加密、限流和请求体限制。",
+  },
+};
 
 function setMessage(text, type = "") {
   saveMessage.textContent = text;
   saveMessage.className = `save-message ${type}`.trim();
+}
+
+function setActiveView(viewName, updateHash = true) {
+  const knownView = viewButtons.some((button) => button.dataset.viewTarget === viewName);
+  const nextView = knownView ? viewName : "overview";
+  const copy = viewCopy[nextView];
+
+  viewButtons.forEach((button) => {
+    const active = button.dataset.viewTarget === nextView;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "page" : "false");
+  });
+
+  viewPanels.forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.viewPanel === nextView);
+  });
+
+  viewKicker.textContent = copy.kicker;
+  viewTitle.textContent = copy.title;
+  viewDescription.textContent = copy.description;
+
+  if (updateHash) {
+    history.replaceState(null, "", `#${nextView}`);
+  }
 }
 
 function providerMeta(provider) {
@@ -29,6 +93,80 @@ function providerMeta(provider) {
   const calls = Number(provider.calls || 0).toLocaleString("zh-CN");
   const remaining = provider.last_remaining ?? "未知";
   return `${enabled} · ${keyState} · 调用 ${calls} 次 · 剩余额度 ${remaining}`;
+}
+
+function providerChips(provider) {
+  const protocolLabels = {
+    openai: "OpenAI",
+    domestic: "国内模型",
+    claude: "Claude",
+    gemini: "Gemini"
+  };
+  const protocol = provider.protocol || "openai";
+  const chips = [
+    {
+      text: provider.enabled === false ? "已停用" : "启用中",
+      tone: provider.enabled === false ? "warn" : "ok",
+    },
+    {
+      text: protocolLabels[protocol] || protocol,
+      tone: "info",
+    },
+    {
+      text: provider.has_api_key || provider.api_key || provider.api_keys_text ? `${provider.key_count || 1} key` : "缺少 key",
+      tone: provider.has_api_key || provider.api_key || provider.api_keys_text ? "ok" : "error",
+    },
+    { text: `优先级 ${provider.priority ?? 0}`, tone: "" },
+  ];
+  if (provider.use_curl) chips.push({ text: "curl 传输", tone: "warn" });
+  if (provider.model) chips.push({ text: provider.model, tone: "" });
+  return chips;
+}
+
+function renderProviderChips(node, provider) {
+  let chipWrap = node.querySelector(".provider-chips");
+  if (!chipWrap) {
+    chipWrap = document.createElement("div");
+    chipWrap.className = "provider-chips";
+    node.querySelector(".provider-meta").after(chipWrap);
+  }
+  chipWrap.innerHTML = "";
+  providerChips(provider).forEach((chip) => {
+    const item = document.createElement("span");
+    item.className = `provider-chip ${chip.tone}`.trim();
+    item.textContent = chip.text;
+    chipWrap.appendChild(item);
+  });
+}
+
+function renderOverviewProviders() {
+  overviewProviderList.innerHTML = "";
+  const sortedProviders = [...providers]
+    .sort((left, right) => Number(left.priority || 0) - Number(right.priority || 0))
+    .slice(0, 4);
+
+  if (sortedProviders.length === 0) {
+    overviewProviderList.innerHTML = '<p class="mini-empty">暂无 provider，先去“API 配置”添加一个。</p>';
+    return;
+  }
+
+  sortedProviders.forEach((provider) => {
+    const item = document.createElement("div");
+    item.className = "mini-item";
+
+    const title = document.createElement("strong");
+    title.textContent = provider.name || "未命名 API";
+
+    const meta = document.createElement("span");
+    const keyState = provider.has_api_key || provider.api_key || provider.api_keys_text ? `${provider.key_count || 1} key` : "缺少 key";
+    meta.textContent = `${provider.enabled === false ? "停用" : "启用"} · ${keyState} · 优先级 ${provider.priority ?? 0}`;
+
+    const dot = document.createElement("i");
+    dot.className = provider.enabled === false ? "status-dot warn" : keyState === "缺少 key" ? "status-dot error" : "status-dot ok";
+
+    item.append(dot, title, meta);
+    overviewProviderList.appendChild(item);
+  });
 }
 
 function renderSecurity(security = {}) {
@@ -48,6 +186,7 @@ function renderProviders() {
     node.dataset.index = index;
     node.querySelector(".provider-title").textContent = provider.name || "新 API";
     node.querySelector(".provider-meta").textContent = providerMeta(provider);
+    renderProviderChips(node, provider);
 
     for (const input of node.querySelectorAll("[data-field]")) {
       const field = input.dataset.field;
@@ -55,6 +194,8 @@ function renderProviders() {
         input.value = provider.api_keys_text || "";
       } else if (input.type === "checkbox") {
         input.checked = Boolean(provider[field]);
+      } else if (input.tagName === "SELECT") {
+        input.value = provider[field] || "openai";
       } else {
         input.value = provider[field] ?? "";
       }
@@ -71,6 +212,7 @@ function renderProviders() {
         }
         node.querySelector(".provider-title").textContent = providers[index].name || "新 API";
         node.querySelector(".provider-meta").textContent = providerMeta(providers[index]);
+        renderProviderChips(node, providers[index]);
         refreshSummary();
       });
     }
@@ -110,6 +252,7 @@ function refreshSummary() {
     .reduce((total, provider) => total + Number(provider.calls || 0), 0)
     .toLocaleString("zh-CN");
   modelSummary.textContent = defaultModelInput.value || "未设置";
+  renderOverviewProviders();
 }
 
 function authHeaders() {
@@ -200,8 +343,40 @@ async function saveConfig() {
     renderSecurity(config.security);
     renderProviders();
     setMessage("已保存，下一次请求会使用新配置", "ok");
+    return config;
   } catch (error) {
     setMessage(error.message, "error");
+    throw error;
+  }
+}
+
+async function saveAndTestAll() {
+  saveAndTestBtn.disabled = true;
+  saveAndTestBtn.textContent = "测试中";
+  try {
+    const config = await saveConfig();
+    const enabledProviders = (config.providers || []).filter((provider) => provider.enabled !== false && provider.name);
+    if (enabledProviders.length === 0) {
+      setMessage("没有可测试的 API：请先添加并启用 provider", "error");
+      return;
+    }
+
+    let passed = 0;
+    for (const provider of enabledProviders) {
+      setMessage(`正在测试 ${provider.name}...`);
+      const result = await fetchJson(`/api/providers/${encodeURIComponent(provider.name)}/check`, {
+        method: "POST",
+      });
+      if (result.ok) passed += 1;
+    }
+
+    await loadConfig();
+    setMessage(`测试完成：${passed}/${enabledProviders.length} 个 API 可用`, passed ? "ok" : "error");
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    saveAndTestBtn.disabled = false;
+    saveAndTestBtn.textContent = "保存并测试全部";
   }
 }
 
@@ -354,7 +529,10 @@ async function fetchModels(index, node) {
     const data = await fetchJson(`/api/providers/${encodeURIComponent(provider.name)}/models`);
     const models = data.models?.data || [];
     if (models.length === 0) {
-      dropdown.innerHTML = '<div class="model-empty">未找到可用模型</div>';
+      const empty = document.createElement("div");
+      empty.className = "model-empty";
+      empty.textContent = "未找到可用模型";
+      dropdown.appendChild(empty);
       dropdown.hidden = false;
       setMessage(`${provider.name} 未返回模型列表`, "error");
       return;
@@ -375,7 +553,10 @@ async function fetchModels(index, node) {
     dropdown.hidden = false;
     setMessage(`已获取 ${models.length} 个模型`, "ok");
   } catch (error) {
-    dropdown.innerHTML = `<div class="model-empty">获取失败：${error.message}</div>`;
+    const errorNode = document.createElement("div");
+    errorNode.className = "model-empty";
+    errorNode.textContent = `获取失败：${error.message}`;
+    dropdown.appendChild(errorNode);
     dropdown.hidden = false;
     setMessage(error.message, "error");
   } finally {
@@ -389,25 +570,104 @@ function formatTime(value) {
   return new Date(value).toLocaleTimeString("zh-CN", { hour12: false });
 }
 
-function renderRequests(requests) {
+function renderEmptyRequestRow(text) {
   requestLogBody.innerHTML = "";
-  if (!requests.length) {
-    requestLogBody.innerHTML = '<tr><td colspan="8" class="empty-cell">暂无请求记录</td></tr>';
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 8;
+  cell.className = "empty-cell";
+  cell.textContent = text;
+  row.appendChild(cell);
+  requestLogBody.appendChild(row);
+}
+
+function appendRequestCell(row, text, className = "") {
+  const cell = document.createElement("td");
+  if (className) cell.className = className;
+  cell.textContent = text;
+  row.appendChild(cell);
+}
+
+function renderOverviewRequests(requests) {
+  overviewRequestList.innerHTML = "";
+  const recentRequests = requests.slice(0, 4);
+
+  if (recentRequests.length === 0) {
+    overviewRequestList.innerHTML = '<p class="mini-empty">暂无请求。配置完成后，客户端调用会显示在这里。</p>';
     return;
   }
-  requests.forEach((entry) => {
+
+  recentRequests.forEach((entry) => {
+    const item = document.createElement("div");
+    item.className = "mini-item";
+
+    const title = document.createElement("strong");
+    title.textContent = `${entry.provider || "-"} · ${entry.status ?? "-"}`;
+
+    const meta = document.createElement("span");
+    meta.textContent = `${formatTime(entry.time)} · ${entry.latency_ms ?? "-"} ms · ${entry.streamed ? "stream" : "json"}`;
+
+    const dot = document.createElement("i");
+    dot.className = Number(entry.status) === 200 ? "status-dot ok" : "status-dot error";
+
+    item.append(dot, title, meta);
+    overviewRequestList.appendChild(item);
+  });
+}
+
+function filteredRequests() {
+  const status = requestStatusFilter.value;
+  const query = requestSearchInput.value.trim().toLowerCase();
+
+  return latestRequests.filter((entry) => {
+    const statusMatched =
+      status === "all" ||
+      (status === "ok" && Number(entry.status) === 200) ||
+      (status === "error" && Number(entry.status) !== 200) ||
+      (status === "stream" && Boolean(entry.streamed));
+
+    const searchable = [
+      entry.provider,
+      entry.status,
+      entry.path,
+      entry.stream_status,
+      entry.error,
+    ]
+      .filter((value) => value !== undefined && value !== null)
+      .join(" ")
+      .toLowerCase();
+
+    return statusMatched && (!query || searchable.includes(query));
+  });
+}
+
+function renderRequests(requests) {
+  requestLogBody.innerHTML = "";
+  latestRequests = requests;
+  renderOverviewRequests(latestRequests);
+  const visibleRequests = filteredRequests();
+
+  if (!requests.length) {
+    renderEmptyRequestRow("暂无请求记录。配置完成后，把客户端 Base URL 指向 http://127.0.0.1:8000/v1，这里就会出现调用轨迹。");
+    return;
+  }
+
+  if (!visibleRequests.length) {
+    renderEmptyRequestRow("没有符合筛选条件的请求。可以切回“全部”或清空搜索关键词。");
+    return;
+  }
+
+  visibleRequests.forEach((entry) => {
     const row = document.createElement("tr");
     const statusClass = Number(entry.status) === 200 ? "ok-text" : "error-text";
-    row.innerHTML = `
-      <td>${formatTime(entry.time)}</td>
-      <td>${entry.provider || "-"}</td>
-      <td class="${statusClass}">${entry.status}</td>
-      <td>${entry.latency_ms ?? "-"} ms</td>
-      <td>${entry.fallback_count ?? 0}</td>
-      <td>${entry.streamed ? "stream" : "json"}</td>
-      <td>${entry.stream_status || "-"}</td>
-      <td class="error-detail">${entry.error || ""}</td>
-    `;
+    appendRequestCell(row, formatTime(entry.time));
+    appendRequestCell(row, entry.provider || "-");
+    appendRequestCell(row, String(entry.status ?? "-"), statusClass);
+    appendRequestCell(row, `${entry.latency_ms ?? "-"} ms`);
+    appendRequestCell(row, String(entry.fallback_count ?? 0));
+    appendRequestCell(row, entry.streamed ? "stream" : "json");
+    appendRequestCell(row, entry.stream_status || "-");
+    appendRequestCell(row, entry.error || "", "error-detail");
     requestLogBody.appendChild(row);
   });
 }
@@ -417,7 +677,7 @@ async function loadRequests() {
     const data = await fetchJson("/api/requests");
     renderRequests(data.requests || []);
   } catch (error) {
-    requestLogBody.innerHTML = `<tr><td colspan="8" class="empty-cell">读取失败：${error.message}</td></tr>`;
+    renderEmptyRequestRow(`读取失败：${error.message}`);
   }
 }
 
@@ -458,8 +718,24 @@ document.addEventListener("click", (event) => {
   copyText(button.dataset.copyTarget);
 });
 
+document.addEventListener("click", (event) => {
+  const viewButton = event.target.closest("[data-view-target]");
+  if (viewButton) {
+    setActiveView(viewButton.dataset.viewTarget);
+    return;
+  }
+
+  const jumpButton = event.target.closest("[data-view-jump]");
+  if (jumpButton) {
+    setActiveView(jumpButton.dataset.viewJump);
+  }
+});
+
 document.querySelector("#addProviderBtn").addEventListener("click", addProvider);
-document.querySelector("#saveBtn").addEventListener("click", saveConfig);
+document.querySelector("#saveBtn").addEventListener("click", () => {
+  saveConfig().catch(() => {});
+});
+saveAndTestBtn.addEventListener("click", saveAndTestAll);
 document.querySelector("#exportConfigBtn").addEventListener("click", exportConfig);
 document.querySelector("#importConfigBtn").addEventListener("click", () => importConfigFile.click());
 importConfigFile.addEventListener("change", () => importConfig(importConfigFile.files?.[0]));
@@ -474,10 +750,13 @@ document.querySelector("#clearProxyTokenBtn").addEventListener("click", () => {
   setMessage("本地代理访问密钥已清除", "ok");
 });
 document.querySelector("#refreshRequestsBtn").addEventListener("click", loadRequests);
+requestStatusFilter.addEventListener("change", () => renderRequests(latestRequests));
+requestSearchInput.addEventListener("input", () => renderRequests(latestRequests));
 document.querySelector("#refreshBtn").addEventListener("click", () => {
   loadConfig().catch((error) => setMessage(error.message, "error"));
 });
 defaultModelInput.addEventListener("input", refreshSummary);
+setActiveView(location.hash.replace("#", "") || "overview", false);
 
 loadConfig().catch((error) => {
   healthBadge.textContent = "服务异常";

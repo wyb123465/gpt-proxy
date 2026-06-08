@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 import time
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -16,17 +15,16 @@ from fastapi.staticfiles import StaticFiles
 
 from ._config import (
     apply_env_overrides,
-    chat_to_responses_payload,
     decrypt_config,
     editable_provider,
     encrypt_config,
     normalize_config_payload,
     provider_api_keys,
     read_json_file,
-    responses_input_to_messages,
     write_json_file,
 )
 from ._providers import (
+    _prepare_forward,
     build_forward_headers,
     build_request_body,
     check_provider,
@@ -34,6 +32,7 @@ from ._providers import (
     curl_stream_request,
     fetch_provider_models,
     forward_to_provider,
+    provider_protocol,
     safe_response_detail,
     should_use_curl,
 )
@@ -300,15 +299,23 @@ async def _try_provider(
     default_model: str,
     api_key: str,
     stream: bool,
+    fwd: dict[str, Any] | None = None,
 ) -> tuple[str, Any]:
+    protocol = (fwd or {}).get("protocol", "openai")
+    passthrough = bool(fwd)
+    path_suffix = (fwd or {}).get("path_suffix", "/chat/completions")
+
     if should_use_curl(provider):
         if stream:
-            url = f"{provider['base_url'].rstrip('/')}/chat/completions"
-            headers = build_forward_headers(api_key)
-            request_body = build_request_body(body, provider, default_model)
+            url, headers, request_body = _prepare_forward(
+                body, provider, default_model, api_key, protocol, path_suffix, passthrough
+            )
             return ("curl_stream", curl_stream_request(url, headers, request_body))
         try:
-            status_code, data = await curl_forward_to_provider(body, provider, default_model, api_key)
+            status_code, data = await curl_forward_to_provider(
+                body, provider, default_model, api_key,
+                protocol=protocol, path_suffix=path_suffix, passthrough=passthrough,
+            )
         except Exception:
             raise
         if status_code == 200:
@@ -319,13 +326,16 @@ async def _try_provider(
 
     try:
         if stream:
-            url = f"{provider['base_url'].rstrip('/')}/chat/completions"
-            headers = build_forward_headers(api_key)
-            request_body = build_request_body(body, provider, default_model)
+            url, headers, request_body = _prepare_forward(
+                body, provider, default_model, api_key, protocol, path_suffix, passthrough
+            )
             upstream_request = client.build_request("POST", url, headers=headers, json=request_body)
             response = await client.send(upstream_request, stream=True)
         else:
-            response = await forward_to_provider(client, body, provider, default_model, api_key)
+            response = await forward_to_provider(
+                client, body, provider, default_model, api_key,
+                protocol=protocol, path_suffix=path_suffix, passthrough=passthrough,
+            )
     except httpx.RequestError:
         raise
 
@@ -351,6 +361,7 @@ async def _iterate_providers(
     callback: Any,
     stream: bool,
     path: str = "/v1/chat/completions",
+    fwd: dict[str, Any] | None = None,
 ) -> Any:
     last_error = "所有后端 API 均不可用"
     fallback_count = 0
@@ -362,7 +373,7 @@ async def _iterate_providers(
         for key_index, api_key in key_attempts:
             started_at = time.perf_counter()
             try:
-                kind, data = await _try_provider(client, body, provider, config["default_model"], api_key, stream)
+                kind, data = await _try_provider(client, body, provider, config["default_model"], api_key, stream, fwd)
             except httpx.RequestError as exc:
                 logger.info("provider=%s status=request_error path=%s", provider_name, path)
                 last_error = str(exc)
@@ -455,9 +466,10 @@ async def stream_chat_completions(
     config: dict[str, Any],
     request: Request | None = None,
     path: str = "/v1/chat/completions",
+    fwd: dict[str, Any] | None = None,
 ) -> StreamingResponse:
     client = get_http_client(request.app) if request else create_http_client()
-    return await _iterate_providers(body, config, client, _stream_callback, stream=True, path=path)
+    return await _iterate_providers(body, config, client, _stream_callback, stream=True, path=path, fwd=fwd)
 
 
 async def proxy_chat_json(
@@ -465,104 +477,35 @@ async def proxy_chat_json(
     config: dict[str, Any],
     request: Request | None = None,
     path: str = "/v1/chat/completions",
+    fwd: dict[str, Any] | None = None,
 ) -> JSONResponse:
     client = get_http_client(request.app) if request else create_http_client()
-    return await _iterate_providers(body, config, client, _json_callback, stream=False, path=path)
+    return await _iterate_providers(body, config, client, _json_callback, stream=False, path=path, fwd=fwd)
 
 
 # ---------------------------------------------------------------------------
-# Responses API SSE
+# Protocol routing helpers
 # ---------------------------------------------------------------------------
 
-def _sse_event(event_type: str, data: dict[str, Any]) -> bytes:
-    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+def _filter_config_by_protocol(config: dict[str, Any], protocols: set[str]) -> dict[str, Any]:
+    """Return a shallow copy of config keeping only providers whose protocol is in `protocols`."""
+    providers = [p for p in config["providers"] if provider_protocol(p) in protocols]
+    return {"providers": providers, "default_model": config.get("default_model", "gpt-3.5-turbo")}
 
 
-async def stream_responses_events(
+async def _passthrough(
     body: dict[str, Any],
     config: dict[str, Any],
     request: Request,
-) -> StreamingResponse:
-    response_id = f"resp_{uuid.uuid4().hex}"
-    model = body.get("model", config["default_model"])
-    accumulated_text = ""
-
-    async def generate():
-        nonlocal accumulated_text
-        yield _sse_event("response.created", {
-            "type": "response.created",
-            "response": {"id": response_id, "object": "response", "model": model, "status": "in_progress"},
-        })
-
-        client = get_http_client(request.app)
-        last_error = "所有后端 API 均不可用"
-        state = load_state()
-
-        for provider in config["providers"]:
-            provider_name = provider["name"]
-            key_attempts = key_attempt_order(provider, state)
-            for key_index, api_key in key_attempts:
-                try:
-                    kind, data = await _try_provider(client, body, provider, config["default_model"], api_key, stream=True)
-                except (httpx.RequestError, HTTPException):
-                    continue
-
-                if kind == "retryable":
-                    if data["status"] == 429:
-                        record_key_cooldown(provider_name, api_key)
-                    last_error = data["detail"]
-                    continue
-
-                record_success(provider_name, httpx.Response(200, json={}), len(key_attempts), key_index)
-
-                if kind == "response":
-                    try:
-                        async for chunk_bytes in data.aiter_bytes():
-                            for line in chunk_bytes.decode("utf-8", errors="replace").split("\n"):
-                                if line.startswith("data: ") and line.strip() != "data: [DONE]":
-                                    try:
-                                        delta = json.loads(line[6:])
-                                        text = delta.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                        if text:
-                                            accumulated_text += text
-                                            yield _sse_event("response.output_text.delta", {
-                                                "type": "response.output_text.delta", "delta": text,
-                                            })
-                                    except (json.JSONDecodeError, IndexError):
-                                        pass
-                    finally:
-                        await data.aclose()
-                elif kind == "curl_stream":
-                    buffer = ""
-                    async for chunk_bytes in data:
-                        buffer += chunk_bytes.decode("utf-8", errors="replace")
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            if line.startswith("data: ") and line.strip() != "data: [DONE]":
-                                try:
-                                    delta = json.loads(line[6:])
-                                    text = delta.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                    if text:
-                                        accumulated_text += text
-                                        yield _sse_event("response.output_text.delta", {
-                                            "type": "response.output_text.delta", "delta": text,
-                                        })
-                                except (json.JSONDecodeError, IndexError):
-                                    pass
-                elif kind == "curl":
-                    payload_text = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
-                    accumulated_text = payload_text
-
-                final_payload = chat_to_responses_payload(
-                    {"model": model, "choices": [{"message": {"content": accumulated_text}}]}, model,
-                )
-                yield _sse_event("response.completed", {"type": "response.completed", "response": final_payload})
-                return
-
-        raise HTTPException(status_code=502, detail=last_error)
-
-    return StreamingResponse(generate(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    protocol: str,
+    path_suffix: str,
+    inbound_path: str,
+) -> Any:
+    """Forward the client body verbatim to the matching backend protocol."""
+    fwd = {"protocol": protocol, "path_suffix": path_suffix}
+    if body.get("stream") is True:
+        return await stream_chat_completions(body, config, request=request, path=inbound_path, fwd=fwd)
+    return await proxy_chat_json(body, config, request=request, path=inbound_path, fwd=fwd)
 
 
 # ---------------------------------------------------------------------------
@@ -584,38 +527,77 @@ def dashboard() -> FileResponse:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    """
+    OpenAI-compatible chat completions endpoint.
+    Supports both OpenAI and domestic model providers.
+    """
     body = await read_v1_json_body(request)
-    config = load_config()
+    config = _filter_config_by_protocol(load_config(), {"openai", "domestic"})
     if not config["providers"]:
-        raise HTTPException(status_code=500, detail="No usable providers configured")
-    if body.get("stream") is True:
-        return await stream_chat_completions(body, config, request=request)
-    return await proxy_chat_json(body, config, request=request)
+        raise HTTPException(
+            status_code=503,
+            detail="No OpenAI or domestic model providers configured. Please add at least one provider with protocol 'openai' or 'domestic'."
+        )
+    return await _passthrough(body, config, request, "domestic", "/chat/completions", "/v1/chat/completions")
 
 
 @app.post("/v1/responses")
 async def responses(request: Request):
-    payload = await read_v1_json_body(request)
-    config = load_config()
+    """
+    OpenAI responses endpoint.
+    Only routes to providers with protocol 'openai'.
+    """
+    body = await read_v1_json_body(request)
+    config = _filter_config_by_protocol(load_config(), {"openai"})
     if not config["providers"]:
-        raise HTTPException(status_code=500, detail="No usable providers configured")
+        raise HTTPException(
+            status_code=503,
+            detail="No OpenAI providers configured. Please add at least one provider with protocol 'openai'."
+        )
+    return await _passthrough(body, config, request, "openai", "/responses", "/v1/responses")
 
-    chat_body = {
-        "model": payload.get("model", config["default_model"]),
-        "messages": responses_input_to_messages(payload),
-    }
-    for key in ("temperature", "top_p", "max_tokens", "max_completion_tokens", "stream"):
-        if key in payload:
-            chat_body[key] = payload[key]
 
-    if chat_body.get("stream") is True:
-        return await stream_responses_events(chat_body, config, request)
+@app.post("/v1/messages")
+async def messages(request: Request):
+    """
+    Claude Messages API endpoint.
+    Only routes to providers with protocol 'claude'.
+    """
+    body = await read_v1_json_body(request)
+    config = _filter_config_by_protocol(load_config(), {"claude"})
+    if not config["providers"]:
+        raise HTTPException(
+            status_code=503,
+            detail="No Claude providers configured. Please add at least one provider with protocol 'claude' and base_url 'https://api.anthropic.com/v1'."
+        )
+    return await _passthrough(body, config, request, "claude", "/messages", "/v1/messages")
 
-    chat_response = await proxy_chat_json(chat_body, config, request=request, path="/v1/responses")
-    if chat_response.status_code != 200:
-        return chat_response
-    chat_data = json.loads(chat_response.body.decode("utf-8"))
-    return JSONResponse(content=chat_to_responses_payload(chat_data, payload.get("model")), status_code=200)
+
+@app.post("/v1beta/models/{rest:path}")
+async def gemini_generate(rest: str, request: Request):
+    """
+    Google Gemini API endpoint.
+    Supports both generateContent and streamGenerateContent.
+    Only routes to providers with protocol 'gemini'.
+    """
+    body = await read_v1_json_body(request)
+    config = _filter_config_by_protocol(load_config(), {"gemini"})
+    if not config["providers"]:
+        raise HTTPException(
+            status_code=503,
+            detail="No Gemini providers configured. Please add at least one provider with protocol 'gemini' and base_url 'https://generativelanguage.googleapis.com/v1beta'."
+        )
+    # rest looks like "gemini-pro:generateContent" or "gemini-pro:streamGenerateContent"
+    if ":" not in rest:
+        raise HTTPException(status_code=404, detail="Invalid Gemini endpoint. Expected format: /v1beta/models/{model}:generateContent")
+    model, verb = rest.rsplit(":", 1)
+    if verb not in {"generateContent", "streamGenerateContent"}:
+        raise HTTPException(status_code=404, detail=f"Unsupported Gemini verb: {verb}. Supported verbs: generateContent, streamGenerateContent")
+    # streamGenerateContent (or ?alt=sse) implies streaming
+    if verb == "streamGenerateContent" or request.query_params.get("alt") == "sse":
+        body["stream"] = True
+    path_suffix = f"/models/{model}:{verb}"
+    return await _passthrough(body, config, request, "gemini", path_suffix, f"/v1beta/models/{rest}")
 
 
 @app.get("/v1/models")
@@ -642,8 +624,36 @@ async def list_models(request: Request) -> dict[str, Any]:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, Any]:
+    """Basic health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/health/detailed")
+def health_detailed() -> dict[str, Any]:
+    """
+    Detailed health check showing protocol availability.
+    Does not require authentication.
+    """
+    config = load_config()
+    protocols = {"openai": 0, "claude": 0, "gemini": 0, "domestic": 0}
+
+    for provider in config["providers"]:
+        protocol = provider_protocol(provider)
+        if protocol in protocols:
+            protocols[protocol] += 1
+
+    return {
+        "status": "ok",
+        "protocols": protocols,
+        "total_providers": len(config["providers"]),
+        "endpoints": {
+            "openai_chat": "/v1/chat/completions (OpenAI & domestic)",
+            "openai_responses": "/v1/responses (OpenAI only)",
+            "claude_messages": "/v1/messages (Claude only)",
+            "gemini_generate": "/v1beta/models/{model}:generateContent (Gemini only)"
+        }
+    }
 
 
 @app.get("/api/config")

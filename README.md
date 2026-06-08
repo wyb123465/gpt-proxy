@@ -4,18 +4,27 @@
 
 ## 已支持能力
 
-- OpenAI 兼容接口：`POST /v1/chat/completions`
-- 基础 Responses 兼容：`POST /v1/responses`
-- 模型列表聚合：`GET /v1/models`
-- 流式输出：支持客户端传 `stream: true`
-- 自动回退：遇到 `403`、`429`、`5xx` 会尝试下一个 Key 或下一个 API
-- 多 Key 轮询：同一个 provider 可配置多个 API Key，成功后自动轮到下一个
-- 429 冷却：某个 Key 触发 429 后会暂时跳过它
-- Provider 启停：临时不用某个 API 时无需删除
-- 请求日志：UI 显示最近请求的 provider、状态码、耗时、回退次数和流式状态
-- 模型别名：客户端请求 `gpt-4o`，后端可转成真实模型名，例如 `mimo-v2.5`
-- 可选安全：代理访问密钥、本地限流、请求体大小限制、配置密钥加密
-- 配置导入/导出：方便备份和迁移
+### 多协议支持
+- ✅ **OpenAI 兼容接口**：`POST /v1/chat/completions`、`POST /v1/responses`
+- ✅ **Claude 原生接口**：`POST /v1/messages`（支持 Anthropic API）
+- ✅ **Gemini 原生接口**：`POST /v1beta/models/{model}:generateContent`（支持 Google Gemini API）
+- ✅ **国内大模型接口**：支持通义千问、智谱GLM、DeepSeek、百川、豆包、混元等（OpenAI 兼容格式）
+
+### 核心功能
+- 🔄 **自动回退**：遇到 `403`、`429`、`5xx` 会尝试下一个 Key 或下一个 API
+- 🔁 **多 Key 轮询**：同一个 provider 可配置多个 API Key，成功后自动轮到下一个
+- ❄️ **429 冷却**：某个 Key 触发 429 后会暂时跳过它
+- 📊 **模型列表聚合**：`GET /v1/models` 聚合所有后端的可用模型
+- 🌊 **流式输出**：支持客户端传 `stream: true`
+- 🔀 **模型别名**：客户端请求 `gpt-4o`，后端可转成真实模型名，例如 `deepseek-chat`
+- 🎯 **请求日志**：UI 显示最近请求的 provider、状态码、耗时、回退次数和流式状态
+- 🎨 **Web 管理界面**：统一管理多个 API，支持启停、导入/导出配置
+
+### 安全特性
+- 🔒 **代理访问密钥**：保护本地代理不被未授权访问
+- 🚦 **本地限流**：防止客户端滥用
+- 📏 **请求体大小限制**：防止超大请求
+- 🔐 **配置密钥加密**：API Key 加密存储到 `config.json`
 
 ## 启动
 
@@ -32,6 +41,12 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 ```powershell
 .\start.ps1   # 启动服务
 .\stop.ps1    # 停止服务
+```
+
+Windows 上想双击启动并自动打开管理台，可以运行：
+
+```powershell
+.\start-ui.bat
 ```
 
 启动后打开管理台：
@@ -69,6 +84,7 @@ $env:GPT_PROXY_CONFIG_SECRET="your-config-encryption-passphrase"
 - `启用该 API`：关闭后代理不会使用它，但配置仍保留。
 - `使用 curl 传输`：遇到 Cloudflare 保护导致 `httpx` 不通时可尝试开启。
 - `模型别名`：左边填客户端发来的模型名，右边填该站点真实模型名。
+- `保存并测试全部`：保存当前配置后逐个测试已启用 provider，并在页面顶部显示通过数量。
 
 ## 统一调用方式
 
@@ -114,23 +130,152 @@ Invoke-WebRequest http://127.0.0.1:8000/v1/models -UseBasicParsing
 
 本地真实配置写在 `config.json`，它已被 `.gitignore` 忽略，不会上传密钥。公开模板是 `config.example.json`。
 
+### 四种协议配置说明
+
+代理支持四种协议类型，每种协议有不同的调用端点和认证方式：
+
+#### 1. OpenAI 协议 (`protocol: "openai"`)
+
+适用于 OpenAI 官方 API 和第三方兼容 API。
+
+```json
+{
+  "name": "openai-official",
+  "protocol": "openai",
+  "base_url": "https://api.openai.com/v1",
+  "model": "gpt-4o",
+  "priority": 0,
+  "enabled": true,
+  "api_keys": ["sk-your-openai-key"],
+  "model_aliases": {
+    "gpt-4": "gpt-4o"
+  }
+}
+```
+
+**调用端点**：
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+
+**认证方式**：`Authorization: Bearer {api_key}`
+
+#### 2. Claude 协议 (`protocol: "claude"`)
+
+适用于 Anthropic Claude 官方 API。
+
+```json
+{
+  "name": "claude-official",
+  "protocol": "claude",
+  "base_url": "https://api.anthropic.com/v1",
+  "model": "claude-sonnet-4-20250514",
+  "priority": 1,
+  "enabled": true,
+  "api_keys": ["sk-ant-your-claude-key"]
+}
+```
+
+**调用端点**：
+- `POST /v1/messages`
+
+**认证方式**：`x-api-key: {api_key}` + `anthropic-version: 2023-06-01`
+
+#### 3. Gemini 协议 (`protocol: "gemini"`)
+
+适用于 Google Gemini 官方 API。
+
+```json
+{
+  "name": "gemini-official",
+  "protocol": "gemini",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "model": "gemini-2.0-flash",
+  "priority": 2,
+  "enabled": true,
+  "api_keys": ["your-gemini-api-key"]
+}
+```
+
+**调用端点**：
+- `POST /v1beta/models/{model}:generateContent`
+- `POST /v1beta/models/{model}:streamGenerateContent`
+
+**认证方式**：`x-goog-api-key: {api_key}`
+
+#### 4. 国内大模型协议 (`protocol: "domestic"`)
+
+适用于国内主流大模型，使用 OpenAI 兼容格式，但可能有特定的认证或参数要求。
+
+**支持的国内大模型**：
+- 🚀 **DeepSeek**：`https://api.deepseek.com/v1`
+- 🌟 **通义千问（Qwen）**：`https://dashscope.aliyuncs.com/compatible-mode/v1`
+- 🤖 **智谱 GLM**：`https://open.bigmodel.cn/api/paas/v4`
+- 🎯 **百川（Baichuan）**
+- 🔥 **豆包（Doubao）**
+- ⚡ **腾讯混元（Hunyuan）**
+- 🌈 **零一万物（Yi）**
+
+**配置示例（DeepSeek）**：
+
+```json
+{
+  "name": "deepseek",
+  "protocol": "domestic",
+  "base_url": "https://api.deepseek.com/v1",
+  "model": "deepseek-chat",
+  "priority": 3,
+  "enabled": true,
+  "api_keys": ["sk-your-deepseek-key"],
+  "model_aliases": {
+    "gpt-3.5-turbo": "deepseek-chat",
+    "gpt-4": "deepseek-chat"
+  }
+}
+```
+
+**调用端点**：
+- `POST /v1/chat/completions`（通过代理统一调用）
+
+**认证方式**：`Authorization: Bearer {api_key}`
+
+### 完整配置示例
+
 ```json
 {
   "providers": [
     {
-      "name": "example",
-      "base_url": "https://api.example.com/v1",
-      "model": "mimo-v2.5",
+      "name": "openai-official",
+      "protocol": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o",
       "priority": 0,
       "enabled": true,
       "api_keys": ["sk-xxx", "sk-yyy"],
       "use_curl": false,
       "model_aliases": {
-        "gpt-4o": "mimo-v2.5"
+        "gpt-4": "gpt-4o"
       }
+    },
+    {
+      "name": "claude",
+      "protocol": "claude",
+      "base_url": "https://api.anthropic.com/v1",
+      "model": "claude-sonnet-4-20250514",
+      "priority": 1,
+      "enabled": true,
+      "api_keys": ["sk-ant-xxx"]
+    },
+    {
+      "name": "deepseek",
+      "protocol": "domestic",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat",
+      "priority": 2,
+      "enabled": true,
+      "api_keys": ["sk-xxx"]
     }
   ],
-  "default_model": "mimo-v2.5"
+  "default_model": "gpt-4o"
 }
 ```
 

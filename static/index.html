@@ -20,22 +20,107 @@
         </div>
       </header>
 
-      <section class="summary" aria-label="状态概览">
-        <div class="metric">
-          <span class="metric-label">可用 API</span>
-          <strong id="usableCount">0</strong>
+      <div class="workspace">
+        <nav class="side-nav" aria-label="管理台导航">
+          <button class="nav-item active" type="button" data-view-target="overview">
+            <span>总览</span>
+            <small>状态和下一步</small>
+          </button>
+          <button class="nav-item" type="button" data-view-target="providers">
+            <span>API 配置</span>
+            <small>provider 和 key</small>
+          </button>
+          <button class="nav-item" type="button" data-view-target="usage">
+            <span>调用方式</span>
+            <small>复制给客户端</small>
+          </button>
+          <button class="nav-item" type="button" data-view-target="requests">
+            <span>请求日志</span>
+            <small>回退和耗时</small>
+          </button>
+          <button class="nav-item" type="button" data-view-target="security">
+            <span>安全设置</span>
+            <small>token 和限制</small>
+          </button>
+        </nav>
+
+        <div class="view-stack">
+      <header class="view-header" aria-live="polite">
+        <div>
+          <p id="viewKicker" class="view-kicker">Overview</p>
+          <h2 id="viewTitle">总览</h2>
+          <p id="viewDescription">查看本地代理状态、当前 API 和最近请求。</p>
         </div>
-        <div class="metric">
-          <span class="metric-label">总调用</span>
-          <strong id="totalCalls">0</strong>
+      </header>
+
+      <section class="overview view-panel active" data-view-panel="overview" aria-label="状态概览">
+        <div class="summary">
+          <div class="metric">
+            <span class="metric-label">可用 API</span>
+            <strong id="usableCount">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">总调用</span>
+            <strong id="totalCalls">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">默认模型</span>
+            <strong id="modelSummary">未设置</strong>
+          </div>
         </div>
-        <div class="metric">
-          <span class="metric-label">默认模型</span>
-          <strong id="modelSummary">未设置</strong>
+
+        <div class="overview-grid">
+          <div class="overview-main">
+            <section class="quickstart" aria-label="快速上手">
+              <div class="quickstart-card primary">
+                <span class="step-dot">1</span>
+                <div>
+                  <h2>先添加 API</h2>
+                  <p>填 Base URL 和 API Keys，优先级越小越先用。模型可以手填，也可以点“获取模型”。</p>
+                </div>
+              </div>
+              <div class="quickstart-card">
+                <span class="step-dot">2</span>
+                <div>
+                  <h2>保存并测试</h2>
+                  <p>保存后可测试单个 API，或一键测试全部已配置的 provider。</p>
+                </div>
+              </div>
+              <div class="quickstart-card">
+                <span class="step-dot">3</span>
+                <div>
+                  <h2>复制统一地址</h2>
+                  <p>其他软件只需要使用本机 Base URL：<code>http://127.0.0.1:8000/v1</code>。</p>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <aside class="overview-side" aria-label="当前状态预览">
+            <section class="mini-panel">
+              <div class="mini-head">
+                <h2>当前 API</h2>
+                <button class="ghost-link" type="button" data-view-jump="providers">去配置</button>
+              </div>
+              <div id="overviewProviderList" class="mini-list">
+                <p class="mini-empty">暂无 provider</p>
+              </div>
+            </section>
+
+            <section class="mini-panel">
+              <div class="mini-head">
+                <h2>最近请求</h2>
+                <button class="ghost-link" type="button" data-view-jump="requests">看全部</button>
+              </div>
+              <div id="overviewRequestList" class="mini-list">
+                <p class="mini-empty">暂无请求</p>
+              </div>
+            </section>
+          </aside>
         </div>
       </section>
 
-      <section class="panel security-panel" aria-label="安全状态">
+      <section class="panel security-panel view-panel" data-view-panel="security" aria-label="安全状态">
         <div class="panel-head">
           <div>
             <h2>安全与兼容</h2>
@@ -43,11 +128,11 @@
           </div>
         </div>
         <div class="security-grid">
-          <div><span>代理访问密钥</span><strong id="proxyTokenState">未启用</strong></div>
-          <div><span>配置加密</span><strong id="encryptionState">未启用</strong></div>
-          <div><span>本地限流</span><strong id="rateLimitState">未启用</strong></div>
-          <div><span>请求大小限制</span><strong id="bodyLimitState">-</strong></div>
-          <div><span>429 冷却</span><strong id="cooldownState">-</strong></div>
+          <div class="status-card"><span>代理访问密钥</span><strong id="proxyTokenState">未启用</strong><small>保护 `/v1/*` 和 `/api/*`</small></div>
+          <div class="status-card"><span>配置加密</span><strong id="encryptionState">未启用</strong><small>`GPT_PROXY_CONFIG_SECRET`</small></div>
+          <div class="status-card"><span>本地限流</span><strong id="rateLimitState">未启用</strong><small>`GPT_PROXY_RATE_LIMIT_PER_MINUTE`</small></div>
+          <div class="status-card"><span>请求大小限制</span><strong id="bodyLimitState">-</strong><small>`GPT_PROXY_MAX_REQUEST_BYTES`</small></div>
+          <div class="status-card"><span>429 冷却</span><strong id="cooldownState">-</strong><small>`GPT_PROXY_KEY_COOLDOWN_SECONDS`</small></div>
         </div>
         <div class="token-row">
           <label class="field">
@@ -59,7 +144,7 @@
         </div>
       </section>
 
-      <section class="panel usage-panel" aria-label="统一调用地址">
+      <section class="panel usage-panel view-panel" data-view-panel="usage" aria-label="统一调用地址">
         <div class="panel-head">
           <div>
             <h2>统一调用地址</h2>
@@ -103,7 +188,7 @@ for chunk in response:
         </div>
       </section>
 
-      <section class="panel config-panel">
+      <section class="panel config-panel view-panel" data-view-panel="providers">
         <div class="panel-head">
           <div>
             <h2>配置 API</h2>
@@ -113,6 +198,7 @@ for chunk in response:
             <button id="exportConfigBtn" class="secondary-btn" type="button">导出配置</button>
             <button id="importConfigBtn" class="secondary-btn" type="button">导入配置</button>
             <button id="addProviderBtn" class="secondary-btn" type="button">添加 API</button>
+            <button id="saveAndTestBtn" class="primary-btn" type="button">保存并测试全部</button>
             <input id="importConfigFile" type="file" accept="application/json,.json" hidden />
           </div>
         </div>
@@ -130,13 +216,28 @@ for chunk in response:
         </footer>
       </section>
 
-      <section class="panel request-panel" aria-label="最近请求">
+      <section class="panel request-panel view-panel" data-view-panel="requests" aria-label="最近请求">
         <div class="panel-head">
           <div>
             <h2>最近请求</h2>
             <p>显示最近 50 次后端尝试，方便判断是否发生回退、是否走了流式、流是否完整结束。</p>
           </div>
           <button id="refreshRequestsBtn" class="secondary-btn" type="button">刷新日志</button>
+        </div>
+        <div class="request-filters" aria-label="请求日志筛选">
+          <label>
+            <span>状态</span>
+            <select id="requestStatusFilter">
+              <option value="all">全部</option>
+              <option value="ok">成功</option>
+              <option value="error">失败</option>
+              <option value="stream">流式</option>
+            </select>
+          </label>
+          <label>
+            <span>搜索</span>
+            <input id="requestSearchInput" autocomplete="off" placeholder="provider / 状态码 / 错误" />
+          </label>
         </div>
         <div class="request-table-wrap">
           <table class="request-table">
@@ -158,6 +259,8 @@ for chunk in response:
           </table>
         </div>
       </section>
+        </div>
+      </div>
     </main>
 
     <template id="providerTemplate">
@@ -177,6 +280,15 @@ for chunk in response:
           <label class="field">
             <span>名称</span>
             <input data-field="name" autocomplete="off" placeholder="free-1" />
+          </label>
+          <label class="field">
+            <span>协议类型</span>
+            <select data-field="protocol">
+              <option value="openai">OpenAI</option>
+              <option value="domestic">国内大模型</option>
+              <option value="claude">Claude</option>
+              <option value="gemini">Gemini</option>
+            </select>
           </label>
           <label class="field">
             <span>优先级</span>

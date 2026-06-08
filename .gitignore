@@ -1,8 +1,19 @@
-.env
-.venv/
+# Python
 __pycache__/
+*.pyc
+.venv/
+
+# Caches
 .pytest_cache/
 .uv-cache/
-*.pyc
+
+# Local runtime data (generated, may contain secrets)
+.env
 state.json
 config.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,21 +1,84 @@
 {
   "providers": [
     {
-      "name": "example",
-      "base_url": "https://api.example.com/v1",
-      "model": "mimo-v2.5",
+      "name": "openai-official",
+      "protocol": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o",
       "priority": 0,
       "enabled": true,
-      "api_key": "sk-your-api-key",
       "api_keys": [
-        "sk-your-api-key",
-        "sk-your-second-api-key"
+        "sk-your-openai-key-1",
+        "sk-your-openai-key-2"
       ],
       "use_curl": false,
       "model_aliases": {
-        "gpt-4o": "mimo-v2.5"
+        "gpt-4": "gpt-4o"
       }
+    },
+    {
+      "name": "claude-official",
+      "protocol": "claude",
+      "base_url": "https://api.anthropic.com/v1",
+      "model": "claude-sonnet-4-20250514",
+      "priority": 1,
+      "enabled": true,
+      "api_keys": [
+        "sk-ant-your-claude-key"
+      ],
+      "use_curl": false
+    },
+    {
+      "name": "gemini-official",
+      "protocol": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "model": "gemini-2.0-flash",
+      "priority": 2,
+      "enabled": true,
+      "api_keys": [
+        "your-gemini-api-key"
+      ],
+      "use_curl": false
+    },
+    {
+      "name": "deepseek",
+      "protocol": "domestic",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat",
+      "priority": 3,
+      "enabled": true,
+      "api_keys": [
+        "sk-your-deepseek-key"
+      ],
+      "use_curl": false,
+      "model_aliases": {
+        "gpt-3.5-turbo": "deepseek-chat"
+      }
+    },
+    {
+      "name": "qwen",
+      "protocol": "domestic",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen-max",
+      "priority": 4,
+      "enabled": false,
+      "api_keys": [
+        "sk-your-qwen-key"
+      ],
+      "use_curl": false
+    },
+    {
+      "name": "glm",
+      "protocol": "domestic",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "model": "glm-4-plus",
+      "priority": 5,
+      "enabled": false,
+      "api_keys": [
+        "your-glm-key"
+      ],
+      "use_curl": false
     }
   ],
-  "default_model": "mimo-v2.5"
+  "default_model": "gpt-4o"
 }
