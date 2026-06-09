@@ -331,6 +331,39 @@ def test_provider_check_all_returns_summary(tmp_path, monkeypatch):
     assert [result["provider"] for result in data["results"]] == ["official", "backup"]
 
 
+def test_provider_models_sync_returns_provider_summary(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            make_provider("official", 0),
+            make_provider("backup", 1),
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    async def fake_fetch(provider):
+        if provider["name"] == "official":
+            return [{"id": "gpt-4o"}, {"id": "shared-model"}]
+        return [{"id": "shared-model"}, {"id": "mimo-v2.5"}]
+
+    monkeypatch.setattr(main, "fetch_provider_models", fake_fetch)
+
+    client = TestClient(main.app)
+    response = client.post("/api/providers/models/sync")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert data["ok"] == 2
+    assert data["unique_model_count"] == 3
+    assert [result["count"] for result in data["results"]] == [2, 2]
+    assert [model["id"] for model in data["models"]] == ["gpt-4o", "shared-model", "mimo-v2.5"]
+
+
 def test_model_alias_replaces_model_name(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"

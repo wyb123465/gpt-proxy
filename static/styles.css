@@ -635,6 +635,58 @@ button:disabled {
 
 .channel-table tr:last-child td { border-bottom: 0; }
 
+.diagnostic-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.diagnostic-card {
+  min-height: 116px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-soft);
+  box-shadow: var(--shadow-subtle);
+}
+
+.diagnostic-card span,
+.diagnostic-card small {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diagnostic-card strong {
+  display: block;
+  margin: 12px 0 8px;
+  color: var(--ink);
+  font-size: 24px;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostic-card.ok strong { color: var(--success); }
+.diagnostic-card.warn strong { color: var(--warning); }
+
+.diagnostic-section {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.diagnostic-section-head h3 {
+  font-size: 16px;
+}
+
+.diagnostic-section-head p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .provider-list {
   display: grid;
   gap: 12px;
@@ -964,7 +1016,7 @@ button:disabled {
   .side-nav {
     position: static;
     min-height: 0;
-    grid-template-columns: repeat(5, minmax(130px, 1fr));
+    grid-template-columns: repeat(6, minmax(130px, 1fr));
     overflow-x: auto;
     padding: 10px 12px;
     border-right: 0;
@@ -979,6 +1031,7 @@ button:disabled {
   .provider-basic, .provider-connection { grid-template-columns: 1fr; }
   .primary-btn, .secondary-btn { width: 100%; }
   .usage-grid, .usage-item { grid-template-columns: 1fr; }
+  .diagnostic-grid { grid-template-columns: 1fr; }
   .security-grid { grid-template-columns: 1fr; }
   .token-row { grid-template-columns: 1fr; }
   .request-filters { grid-template-columns: 1fr; }

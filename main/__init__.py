@@ -795,3 +795,63 @@ async def provider_models_endpoint(provider_name: str, request: Request) -> dict
             models = await fetch_provider_models(provider)
             return {"provider": provider_name, "status": 200, "models": {"object": "list", "data": models}}
     raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
+
+
+@app.post("/api/providers/models/sync")
+async def provider_models_sync(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_config()
+    semaphore = asyncio.Semaphore(6)
+
+    async def run_fetch(provider: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                models = await fetch_provider_models(provider)
+            except Exception as exc:
+                return {
+                    "provider": provider["name"],
+                    "protocol": provider_protocol(provider),
+                    "model": provider.get("model", config["default_model"]),
+                    "ok": False,
+                    "count": 0,
+                    "models": [],
+                    "detail": str(exc),
+                }
+
+            fallback_used = False
+            if not models and provider.get("model"):
+                fallback_used = True
+                models = [{"id": provider["model"], "object": "model"}]
+
+            return {
+                "provider": provider["name"],
+                "protocol": provider_protocol(provider),
+                "model": provider.get("model", config["default_model"]),
+                "ok": bool(models),
+                "count": len(models),
+                "models": models,
+                "fallback_used": fallback_used,
+                "detail": "ok" if models else "未返回模型列表",
+            }
+
+    results = await asyncio.gather(*(run_fetch(provider) for provider in config["providers"]))
+    ok_count = sum(1 for result in results if result.get("ok"))
+    unique_models: dict[str, dict[str, Any]] = {}
+    for result in results:
+        for model in result.get("models", []):
+            model_id = model.get("id")
+            if model_id and model_id not in unique_models:
+                unique_models[model_id] = {
+                    "id": model_id,
+                    "provider": result["provider"],
+                    "protocol": result["protocol"],
+                }
+
+    return {
+        "total": len(results),
+        "ok": ok_count,
+        "failed": len(results) - ok_count,
+        "unique_model_count": len(unique_models),
+        "models": list(unique_models.values()),
+        "results": results,
+    }

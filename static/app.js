@@ -12,6 +12,9 @@ const overviewProviderList = document.querySelector("#overviewProviderList");
 const overviewProtocolList = document.querySelector("#overviewProtocolList");
 const overviewRequestList = document.querySelector("#overviewRequestList");
 const checkReport = document.querySelector("#checkReport");
+const diagnosticSummary = document.querySelector("#diagnosticSummary");
+const diagnosticCheckReport = document.querySelector("#diagnosticCheckReport");
+const modelSyncReport = document.querySelector("#modelSyncReport");
 const proxyTokenState = document.querySelector("#proxyTokenState");
 const encryptionState = document.querySelector("#encryptionState");
 const rateLimitState = document.querySelector("#rateLimitState");
@@ -28,9 +31,12 @@ const requestSearchInput = document.querySelector("#requestSearchInput");
 const viewButtons = Array.from(document.querySelectorAll("[data-view-target]"));
 const viewPanels = Array.from(document.querySelectorAll("[data-view-panel]"));
 const viewJumpButtons = Array.from(document.querySelectorAll("[data-view-jump]"));
+const runDiagnosticsBtn = document.querySelector("#runDiagnosticsBtn");
+const syncModelsBtn = document.querySelector("#syncModelsBtn");
 
 let providers = [];
 let latestRequests = [];
+let latestSecurity = {};
 localProxyTokenInput.value = localStorage.getItem("gpt_proxy_access_token") || "";
 
 const protocolLabels = {
@@ -50,6 +56,11 @@ const viewCopy = {
     kicker: "Providers",
     title: "API 配置",
     description: "维护 provider、优先级、多 key 轮询、模型别名和连通性测试。",
+  },
+  diagnostics: {
+    kicker: "Diagnostics",
+    title: "配置体检",
+    description: "批量检查 API 连通性、密钥状态和模型列表。",
   },
   usage: {
     kicker: "Client setup",
@@ -209,11 +220,55 @@ function renderOverviewProtocols(protocols = null) {
 }
 
 function renderSecurity(security = {}) {
+  latestSecurity = security;
   proxyTokenState.textContent = security.proxy_access_token_enabled ? "已启用" : "未启用";
   encryptionState.textContent = security.config_encryption_enabled ? "已启用" : "未启用";
   rateLimitState.textContent = security.rate_limit_per_minute > 0 ? `${security.rate_limit_per_minute}/分钟` : "未启用";
   bodyLimitState.textContent = security.max_request_bytes ? `${Math.round(security.max_request_bytes / 1024)} KB` : "未限制";
   cooldownState.textContent = security.key_cooldown_seconds ? `${security.key_cooldown_seconds} 秒` : "未启用";
+  renderDiagnosticSummary();
+}
+
+function providerHasKey(provider) {
+  return Boolean(provider.has_api_key || provider.api_key || provider.api_keys_text);
+}
+
+function diagnosticCard(label, value, hint, tone = "") {
+  const card = document.createElement("div");
+  card.className = `diagnostic-card ${tone}`.trim();
+
+  const labelNode = document.createElement("span");
+  labelNode.textContent = label;
+
+  const valueNode = document.createElement("strong");
+  valueNode.textContent = value;
+
+  const hintNode = document.createElement("small");
+  hintNode.textContent = hint;
+
+  card.append(labelNode, valueNode, hintNode);
+  return card;
+}
+
+function renderDiagnosticSummary() {
+  if (!diagnosticSummary) return;
+  const enabledProviders = providers.filter((provider) => provider.enabled !== false);
+  const readyProviders = enabledProviders.filter(providerHasKey);
+  const missingKeys = enabledProviders.length - readyProviders.length;
+  const protocolCounts = fallbackProtocolCounts();
+  const activeProtocols = Object.entries(protocolCounts)
+    .filter(([, count]) => count > 0)
+    .map(([protocol]) => protocolLabels[protocol] || protocol);
+
+  diagnosticSummary.innerHTML = "";
+  diagnosticSummary.append(
+    diagnosticCard("已启用 API", enabledProviders.length.toLocaleString("zh-CN"), `${providers.length} 个配置项`, enabledProviders.length ? "ok" : "warn"),
+    diagnosticCard("可参与回退", readyProviders.length.toLocaleString("zh-CN"), missingKeys ? `${missingKeys} 个缺少 key` : "密钥状态正常", missingKeys ? "warn" : "ok"),
+    diagnosticCard("协议覆盖", activeProtocols.length ? activeProtocols.join(" / ") : "未配置", "当前启用渠道协议", activeProtocols.length ? "" : "warn"),
+    diagnosticCard("访问保护", latestSecurity.proxy_access_token_enabled ? "已启用" : "未启用", "GPT_PROXY_ACCESS_TOKEN", latestSecurity.proxy_access_token_enabled ? "ok" : "warn"),
+    diagnosticCard("配置加密", latestSecurity.config_encryption_enabled ? "已启用" : "未启用", "GPT_PROXY_CONFIG_SECRET", latestSecurity.config_encryption_enabled ? "ok" : "warn"),
+    diagnosticCard("429 冷却", latestSecurity.key_cooldown_seconds ? `${latestSecurity.key_cooldown_seconds} 秒` : "未启用", "免费额度场景建议开启", latestSecurity.key_cooldown_seconds ? "ok" : "warn"),
+  );
 }
 
 function appendChannelCell(row, text, className = "") {
@@ -345,6 +400,7 @@ function refreshSummary() {
   modelSummary.textContent = defaultModelInput.value || "未设置";
   renderOverviewProviders();
   renderOverviewProtocols();
+  renderDiagnosticSummary();
 }
 
 function authHeaders() {
@@ -445,9 +501,9 @@ async function saveConfig() {
   }
 }
 
-function renderCheckReport(report) {
-  checkReport.hidden = false;
-  checkReport.innerHTML = "";
+function renderCheckReport(report, target = checkReport) {
+  target.hidden = false;
+  target.innerHTML = "";
 
   const header = document.createElement("div");
   header.className = "check-report-head";
@@ -456,7 +512,7 @@ function renderCheckReport(report) {
   const summary = document.createElement("span");
   summary.textContent = report.failed ? `${report.failed} 个失败，需要检查 key、模型或 Base URL` : "全部 provider 响应正常";
   header.append(title, summary);
-  checkReport.appendChild(header);
+  target.appendChild(header);
 
   const list = document.createElement("div");
   list.className = "check-report-list";
@@ -477,7 +533,7 @@ function renderCheckReport(report) {
     item.append(name, meta, detail);
     list.appendChild(item);
   });
-  checkReport.appendChild(list);
+  target.appendChild(list);
 }
 
 async function saveAndTestAll() {
@@ -500,6 +556,79 @@ async function saveAndTestAll() {
   } finally {
     saveAndTestBtn.disabled = false;
     saveAndTestBtn.textContent = "保存并测试全部";
+  }
+}
+
+function renderModelSyncReport(report) {
+  modelSyncReport.hidden = false;
+  modelSyncReport.innerHTML = "";
+
+  const header = document.createElement("div");
+  header.className = "check-report-head";
+  const title = document.createElement("strong");
+  title.textContent = `模型同步：${report.unique_model_count || 0} 个唯一模型`;
+  const summary = document.createElement("span");
+  summary.textContent = report.failed ? `${report.failed} 个 API 未返回模型` : `${report.ok}/${report.total} 个 API 有模型信息`;
+  header.append(title, summary);
+  modelSyncReport.appendChild(header);
+
+  const list = document.createElement("div");
+  list.className = "check-report-list";
+  (report.results || []).forEach((result) => {
+    const item = document.createElement("div");
+    item.className = `check-report-item ${result.ok ? "ok" : "error"}`;
+
+    const name = document.createElement("strong");
+    name.textContent = result.provider || "-";
+
+    const meta = document.createElement("span");
+    const protocol = protocolLabels[result.protocol] || result.protocol || "OpenAI";
+    meta.textContent = `${protocol} · ${result.count || 0} 个模型${result.fallback_used ? " · 使用已配置模型" : ""}`;
+
+    const detail = document.createElement("small");
+    const sample = (result.models || []).slice(0, 6).map((model) => model.id).filter(Boolean).join("、");
+    detail.textContent = sample || result.detail || "未返回模型列表";
+
+    item.append(name, meta, detail);
+    list.appendChild(item);
+  });
+  modelSyncReport.appendChild(list);
+}
+
+async function runDiagnostics() {
+  runDiagnosticsBtn.disabled = true;
+  runDiagnosticsBtn.textContent = "体检中";
+  try {
+    await saveConfig();
+    setMessage("正在执行配置体检...");
+    const report = await fetchJson("/api/providers/check-all", { method: "POST" });
+    renderCheckReport(report, diagnosticCheckReport);
+    await loadConfig();
+    setActiveView("diagnostics");
+    setMessage(`体检完成：${report.ok}/${report.total} 个 API 可用`, report.ok ? "ok" : "error");
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    runDiagnosticsBtn.disabled = false;
+    runDiagnosticsBtn.textContent = "保存并体检";
+  }
+}
+
+async function syncProviderModels() {
+  syncModelsBtn.disabled = true;
+  syncModelsBtn.textContent = "同步中";
+  try {
+    await saveConfig();
+    setMessage("正在批量获取模型列表...");
+    const report = await fetchJson("/api/providers/models/sync", { method: "POST" });
+    renderModelSyncReport(report);
+    setActiveView("diagnostics");
+    setMessage(`模型同步完成：${report.unique_model_count || 0} 个唯一模型`, report.unique_model_count ? "ok" : "error");
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    syncModelsBtn.disabled = false;
+    syncModelsBtn.textContent = "批量获取模型";
   }
 }
 
@@ -860,6 +989,8 @@ document.querySelector("#saveBtn").addEventListener("click", () => {
   saveConfig().catch(() => {});
 });
 saveAndTestBtn.addEventListener("click", saveAndTestAll);
+runDiagnosticsBtn.addEventListener("click", runDiagnostics);
+syncModelsBtn.addEventListener("click", syncProviderModels);
 document.querySelector("#exportConfigBtn").addEventListener("click", exportConfig);
 document.querySelector("#importConfigBtn").addEventListener("click", () => importConfigFile.click());
 importConfigFile.addEventListener("change", () => importConfig(importConfigFile.files?.[0]));

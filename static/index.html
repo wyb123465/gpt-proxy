@@ -30,6 +30,10 @@
             <span>API 配置</span>
             <small>provider 和 key</small>
           </button>
+          <button class="nav-item" type="button" data-view-target="diagnostics">
+            <span>配置体检</span>
+            <small>连通性和模型</small>
+          </button>
           <button class="nav-item" type="button" data-view-target="usage">
             <span>调用方式</span>
             <small>复制给客户端</small>
@@ -151,6 +155,37 @@
           </label>
           <button id="saveProxyTokenBtn" class="secondary-btn" type="button">保存密钥</button>
           <button id="clearProxyTokenBtn" class="ghost-btn" type="button">清除</button>
+        </div>
+      </section>
+
+      <section class="panel diagnostics-panel view-panel" data-view-panel="diagnostics" aria-label="配置体检">
+        <div class="panel-head">
+          <div>
+            <h2>配置体检</h2>
+            <p>保存当前配置后，批量检查连通性、密钥状态和后端模型列表。</p>
+          </div>
+          <div class="panel-actions">
+            <button id="runDiagnosticsBtn" class="primary-btn" type="button">保存并体检</button>
+            <button id="syncModelsBtn" class="secondary-btn" type="button">批量获取模型</button>
+          </div>
+        </div>
+
+        <div id="diagnosticSummary" class="diagnostic-grid" aria-label="配置摘要"></div>
+
+        <div class="diagnostic-section">
+          <div class="diagnostic-section-head">
+            <h3>连通性检测</h3>
+            <p>遇到失败优先检查 Base URL、API Key、模型名和协议类型。</p>
+          </div>
+          <div id="diagnosticCheckReport" class="check-report" hidden></div>
+        </div>
+
+        <div class="diagnostic-section">
+          <div class="diagnostic-section-head">
+            <h3>模型同步报告</h3>
+            <p>用于确认每个 API 能返回哪些模型；不自动改写你的配置。</p>
+          </div>
+          <div id="modelSyncReport" class="check-report" hidden></div>
         </div>
       </section>
 
