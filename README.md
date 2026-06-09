@@ -33,8 +33,11 @@
 ```powershell
 cd C:\Users\lenovo\Desktop\zhongzhuan\gpt-proxy
 $env:UV_CACHE_DIR="C:\Users\lenovo\Desktop\zhongzhuan\gpt-proxy\.uv-cache"
+uv sync
 uv run uvicorn main:app --host 127.0.0.1 --port 8000
 ```
+
+之后再次启动时，只需要执行最后一行 `uv run uvicorn main:app --host 127.0.0.1 --port 8000`。
 
 或者直接运行脚本：
 

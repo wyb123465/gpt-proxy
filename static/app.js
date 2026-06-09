@@ -2,13 +2,16 @@ const providerList = document.querySelector("#providerList");
 const providerTemplate = document.querySelector("#providerTemplate");
 const defaultModelInput = document.querySelector("#defaultModel");
 const saveMessage = document.querySelector("#saveMessage");
+const channelOverviewBody = document.querySelector("#channelOverviewBody");
 const healthBadge = document.querySelector("#healthBadge");
 const usableCount = document.querySelector("#usableCount");
 const totalCalls = document.querySelector("#totalCalls");
 const modelSummary = document.querySelector("#modelSummary");
 const requestLogBody = document.querySelector("#requestLogBody");
 const overviewProviderList = document.querySelector("#overviewProviderList");
+const overviewProtocolList = document.querySelector("#overviewProtocolList");
 const overviewRequestList = document.querySelector("#overviewRequestList");
+const checkReport = document.querySelector("#checkReport");
 const proxyTokenState = document.querySelector("#proxyTokenState");
 const encryptionState = document.querySelector("#encryptionState");
 const rateLimitState = document.querySelector("#rateLimitState");
@@ -29,6 +32,13 @@ const viewJumpButtons = Array.from(document.querySelectorAll("[data-view-jump]")
 let providers = [];
 let latestRequests = [];
 localProxyTokenInput.value = localStorage.getItem("gpt_proxy_access_token") || "";
+
+const protocolLabels = {
+  openai: "OpenAI",
+  domestic: "国内",
+  claude: "Claude",
+  gemini: "Gemini",
+};
 
 const viewCopy = {
   overview: {
@@ -61,6 +71,10 @@ const viewCopy = {
 function setMessage(text, type = "") {
   saveMessage.textContent = text;
   saveMessage.className = `save-message ${type}`.trim();
+}
+
+function providerDomId(index) {
+  return `provider-card-${index}`;
 }
 
 function setActiveView(viewName, updateHash = true) {
@@ -96,12 +110,6 @@ function providerMeta(provider) {
 }
 
 function providerChips(provider) {
-  const protocolLabels = {
-    openai: "OpenAI",
-    domestic: "国内模型",
-    claude: "Claude",
-    gemini: "Gemini"
-  };
   const protocol = provider.protocol || "openai";
   const chips = [
     {
@@ -169,12 +177,92 @@ function renderOverviewProviders() {
   });
 }
 
+function fallbackProtocolCounts() {
+  return providers.reduce((counts, provider) => {
+    const protocol = provider.protocol || "openai";
+    if (!counts[protocol]) counts[protocol] = 0;
+    if (provider.enabled !== false) counts[protocol] += 1;
+    return counts;
+  }, { openai: 0, domestic: 0, claude: 0, gemini: 0 });
+}
+
+function renderOverviewProtocols(protocols = null) {
+  const counts = protocols || fallbackProtocolCounts();
+  overviewProtocolList.innerHTML = "";
+
+  Object.entries(protocolLabels).forEach(([protocol, label]) => {
+    const item = document.createElement("div");
+    item.className = "protocol-item";
+
+    const name = document.createElement("span");
+    name.textContent = label;
+
+    const count = document.createElement("strong");
+    count.textContent = Number(counts[protocol] || 0).toLocaleString("zh-CN");
+
+    const hint = document.createElement("small");
+    hint.textContent = Number(counts[protocol] || 0) > 0 ? "已配置" : "未配置";
+
+    item.append(name, count, hint);
+    overviewProtocolList.appendChild(item);
+  });
+}
+
 function renderSecurity(security = {}) {
   proxyTokenState.textContent = security.proxy_access_token_enabled ? "已启用" : "未启用";
   encryptionState.textContent = security.config_encryption_enabled ? "已启用" : "未启用";
   rateLimitState.textContent = security.rate_limit_per_minute > 0 ? `${security.rate_limit_per_minute}/分钟` : "未启用";
   bodyLimitState.textContent = security.max_request_bytes ? `${Math.round(security.max_request_bytes / 1024)} KB` : "未限制";
   cooldownState.textContent = security.key_cooldown_seconds ? `${security.key_cooldown_seconds} 秒` : "未启用";
+}
+
+function appendChannelCell(row, text, className = "") {
+  const cell = document.createElement("td");
+  if (className) cell.className = className;
+  cell.textContent = text;
+  row.appendChild(cell);
+}
+
+function renderChannelOverview() {
+  channelOverviewBody.innerHTML = "";
+  if (providers.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 8;
+    cell.className = "empty-cell";
+    cell.textContent = "暂无 API，点击“添加 API”开始配置。";
+    row.appendChild(cell);
+    channelOverviewBody.appendChild(row);
+    return;
+  }
+
+  providers.forEach((provider, index) => {
+    const row = document.createElement("tr");
+    const protocol = provider.protocol || "openai";
+    const hasKey = provider.has_api_key || provider.api_key || provider.api_keys_text;
+    const enabled = provider.enabled !== false;
+
+    appendChannelCell(row, provider.name || "新 API");
+    appendChannelCell(row, protocolLabels[protocol] || protocol);
+    appendChannelCell(row, provider.model || defaultModelInput.value || "-");
+    appendChannelCell(row, String(provider.priority ?? 0));
+    appendChannelCell(row, hasKey ? `${provider.key_count || 1}` : "0", hasKey ? "" : "error-text");
+    appendChannelCell(row, Number(provider.calls || 0).toLocaleString("zh-CN"));
+    appendChannelCell(row, enabled ? "启用" : "停用", enabled ? "ok-text" : "error-text");
+
+    const actionCell = document.createElement("td");
+    const button = document.createElement("button");
+    button.className = "ghost-link";
+    button.type = "button";
+    button.textContent = "编辑";
+    button.addEventListener("click", () => {
+      document.querySelector(`#${providerDomId(index)}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    actionCell.appendChild(button);
+    row.appendChild(actionCell);
+
+    channelOverviewBody.appendChild(row);
+  });
 }
 
 function renderProviders() {
@@ -184,6 +272,7 @@ function renderProviders() {
 
     const node = providerTemplate.content.firstElementChild.cloneNode(true);
     node.dataset.index = index;
+    node.id = providerDomId(index);
     node.querySelector(".provider-title").textContent = provider.name || "新 API";
     node.querySelector(".provider-meta").textContent = providerMeta(provider);
     renderProviderChips(node, provider);
@@ -213,6 +302,7 @@ function renderProviders() {
         node.querySelector(".provider-title").textContent = providers[index].name || "新 API";
         node.querySelector(".provider-meta").textContent = providerMeta(providers[index]);
         renderProviderChips(node, providers[index]);
+        renderChannelOverview();
         refreshSummary();
       });
     }
@@ -243,6 +333,7 @@ function renderProviders() {
 
     providerList.appendChild(node);
   });
+  renderChannelOverview();
   refreshSummary();
 }
 
@@ -253,6 +344,7 @@ function refreshSummary() {
     .toLocaleString("zh-CN");
   modelSummary.textContent = defaultModelInput.value || "未设置";
   renderOverviewProviders();
+  renderOverviewProtocols();
 }
 
 function authHeaders() {
@@ -284,8 +376,9 @@ async function fetchJson(url, options = {}) {
 
 async function loadConfig() {
   setMessage("正在读取配置...");
-  const [health, config] = await Promise.all([
+  const [health, detailedHealth, config] = await Promise.all([
     fetchJson("/health").catch(() => null),
+    fetchJson("/health/detailed").catch(() => null),
     fetchJson("/api/config"),
   ]);
 
@@ -295,6 +388,7 @@ async function loadConfig() {
   providers = config.providers || [];
   renderSecurity(config.security);
   renderProviders();
+  renderOverviewProtocols(detailedHealth?.protocols);
   await loadRequests();
   setMessage("配置已载入", "ok");
 }
@@ -311,6 +405,7 @@ function collectPayload() {
     default_model: defaultModelInput.value.trim() || "gpt-4o",
     providers: providers.map((provider) => ({
       name: String(provider.name || "").trim(),
+      protocol: String(provider.protocol || "openai").trim() || "openai",
       base_url: String(provider.base_url || "").trim(),
       model: String(provider.model || "").trim(),
       priority: Number(provider.priority || 0),
@@ -350,28 +445,56 @@ async function saveConfig() {
   }
 }
 
+function renderCheckReport(report) {
+  checkReport.hidden = false;
+  checkReport.innerHTML = "";
+
+  const header = document.createElement("div");
+  header.className = "check-report-head";
+  const title = document.createElement("strong");
+  title.textContent = `检测完成：${report.ok}/${report.total} 个可用`;
+  const summary = document.createElement("span");
+  summary.textContent = report.failed ? `${report.failed} 个失败，需要检查 key、模型或 Base URL` : "全部 provider 响应正常";
+  header.append(title, summary);
+  checkReport.appendChild(header);
+
+  const list = document.createElement("div");
+  list.className = "check-report-list";
+  (report.results || []).forEach((result) => {
+    const item = document.createElement("div");
+    item.className = `check-report-item ${result.ok ? "ok" : "error"}`;
+
+    const name = document.createElement("strong");
+    name.textContent = result.provider || "-";
+
+    const meta = document.createElement("span");
+    const protocol = protocolLabels[result.protocol] || result.protocol || "OpenAI";
+    meta.textContent = `${protocol} · ${result.model || "-"} · ${result.status}`;
+
+    const detail = document.createElement("small");
+    detail.textContent = result.ok ? "连接正常" : formatCheckDetail(result.detail);
+
+    item.append(name, meta, detail);
+    list.appendChild(item);
+  });
+  checkReport.appendChild(list);
+}
+
 async function saveAndTestAll() {
   saveAndTestBtn.disabled = true;
   saveAndTestBtn.textContent = "测试中";
   try {
-    const config = await saveConfig();
-    const enabledProviders = (config.providers || []).filter((provider) => provider.enabled !== false && provider.name);
-    if (enabledProviders.length === 0) {
+    await saveConfig();
+    setMessage("正在批量检测所有可用 API...");
+    const report = await fetchJson("/api/providers/check-all", { method: "POST" });
+    renderCheckReport(report);
+    if (report.total === 0) {
       setMessage("没有可测试的 API：请先添加并启用 provider", "error");
       return;
     }
 
-    let passed = 0;
-    for (const provider of enabledProviders) {
-      setMessage(`正在测试 ${provider.name}...`);
-      const result = await fetchJson(`/api/providers/${encodeURIComponent(provider.name)}/check`, {
-        method: "POST",
-      });
-      if (result.ok) passed += 1;
-    }
-
     await loadConfig();
-    setMessage(`测试完成：${passed}/${enabledProviders.length} 个 API 可用`, passed ? "ok" : "error");
+    setMessage(`检测完成：${report.ok}/${report.total} 个 API 可用`, report.ok ? "ok" : "error");
   } catch (error) {
     setMessage(error.message, "error");
   } finally {
@@ -684,6 +807,7 @@ async function loadRequests() {
 function addProvider() {
   providers.push({
     name: `provider-${providers.length + 1}`,
+    protocol: "openai",
     base_url: "https://example.com/v1",
     model: "",
     priority: providers.length,

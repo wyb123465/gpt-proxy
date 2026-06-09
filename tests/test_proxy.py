@@ -299,6 +299,38 @@ def test_provider_check_returns_no_api_key_when_key_missing(tmp_path, monkeypatc
     assert data["status"] == "no_api_key"
 
 
+def test_provider_check_all_returns_summary(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            make_provider("official", 0),
+            make_provider("backup", 1),
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    async def fake_check(provider, default_model):
+        if provider["name"] == "official":
+            return {"ok": True, "status": 200, "detail": "ok"}
+        return {"ok": False, "status": 429, "detail": {"error": "quota"}}
+
+    monkeypatch.setattr(main, "check_provider", fake_check)
+
+    client = TestClient(main.app)
+    response = client.post("/api/providers/check-all")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert data["ok"] == 1
+    assert data["failed"] == 1
+    assert [result["provider"] for result in data["results"]] == ["official", "backup"]
+
+
 def test_model_alias_replaces_model_name(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"
@@ -796,6 +828,38 @@ def test_proxy_access_token_protects_management_config_export(tmp_path, monkeypa
     assert denied.status_code == 401
     assert allowed.status_code == 200
     assert allowed.json()["providers"][0]["api_key"] == "secret-key"
+
+
+def test_dashboard_config_preserves_provider_protocol(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    config_path.write_text("{}", encoding="utf-8")
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/api/config",
+        json={
+            "default_model": "claude-sonnet-4-20250514",
+            "providers": [
+                {
+                    "name": "claude",
+                    "protocol": "claude",
+                    "base_url": "https://api.anthropic.com/v1",
+                    "model": "claude-sonnet-4-20250514",
+                    "priority": 0,
+                    "api_keys": ["sk-ant-test-key"],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["providers"][0]["protocol"] == "claude"
+    assert response.json()["providers"][0]["protocol"] == "claude"
 
 
 def test_config_keys_can_be_encrypted_at_rest(tmp_path, monkeypatch):

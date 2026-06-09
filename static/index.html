@@ -109,6 +109,16 @@
 
             <section class="mini-panel">
               <div class="mini-head">
+                <h2>协议健康</h2>
+                <button class="ghost-link" type="button" data-view-jump="usage">看端点</button>
+              </div>
+              <div id="overviewProtocolList" class="protocol-grid">
+                <p class="mini-empty">正在读取协议状态</p>
+              </div>
+            </section>
+
+            <section class="mini-panel">
+              <div class="mini-head">
                 <h2>最近请求</h2>
                 <button class="ghost-link" type="button" data-view-jump="requests">看全部</button>
               </div>
@@ -208,7 +218,36 @@ for chunk in response:
           <input id="defaultModel" autocomplete="off" placeholder="gpt-4o" />
         </label>
 
+        <div class="channel-overview" aria-label="渠道概览">
+          <div class="channel-overview-head">
+            <div>
+              <h3>渠道概览</h3>
+              <p>参考 new-api 的渠道列表，只保留本地代理需要的状态和入口。</p>
+            </div>
+          </div>
+          <div class="channel-table-wrap">
+            <table class="channel-table">
+              <thead>
+                <tr>
+                  <th>API</th>
+                  <th>协议</th>
+                  <th>模型</th>
+                  <th>优先级</th>
+                  <th>Key</th>
+                  <th>调用</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="channelOverviewBody">
+                <tr><td colspan="8" class="empty-cell">暂无 API，点击“添加 API”开始配置。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <div id="providerList" class="provider-list"></div>
+        <div id="checkReport" class="check-report" hidden></div>
 
         <footer class="form-footer">
           <p id="saveMessage" class="save-message" role="status"></p>

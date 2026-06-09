@@ -1,0 +1,20 @@
+[project]
+name = "gpt-proxy"
+version = "0.1.0"
+description = "Local lightweight multi-provider GPT API proxy with a web console."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=42.0.0",
+    "fastapi>=0.110.0",
+    "httpx>=0.27.0",
+    "uvicorn[standard]>=0.27.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

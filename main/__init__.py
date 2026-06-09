@@ -760,6 +760,32 @@ async def provider_check(provider_name: str, request: Request) -> dict[str, Any]
     raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' does not exist in config")
 
 
+@app.post("/api/providers/check-all")
+async def providers_check_all(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_config()
+    semaphore = asyncio.Semaphore(6)
+
+    async def run_check(provider: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:
+            result = await check_provider(provider, config["default_model"])
+            return {
+                "provider": provider["name"],
+                "protocol": provider_protocol(provider),
+                "model": provider.get("model", config["default_model"]),
+                **result,
+            }
+
+    results = await asyncio.gather(*(run_check(provider) for provider in config["providers"]))
+    ok_count = sum(1 for result in results if result.get("ok"))
+    return {
+        "total": len(results),
+        "ok": ok_count,
+        "failed": len(results) - ok_count,
+        "results": results,
+    }
+
+
 @app.get("/api/providers/{provider_name}/models")
 async def provider_models_endpoint(provider_name: str, request: Request) -> dict[str, Any]:
     require_proxy_access(request)
