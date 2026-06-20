@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>GPT Proxy Console</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260620-ui7" />
   </head>
   <body>
     <main class="shell">
@@ -72,6 +72,22 @@
             <strong id="modelSummary">未设置</strong>
           </div>
         </div>
+
+        <section class="overview-callout" aria-label="本机统一调用地址">
+          <div>
+            <span class="callout-kicker">本机统一调用</span>
+            <h2>OpenAI 兼容客户端继续填这个 Base URL</h2>
+            <p>Codex++、OpenAI SDK、ChatBox 等 OpenAI 兼容客户端一般只需要填本机地址；OpenAI 和国内兼容 API 会按优先级自动回退。</p>
+          </div>
+          <div class="callout-endpoint">
+            <code id="overviewBaseUrlText">http://127.0.0.1:8000/v1</code>
+            <button class="secondary-btn copy-btn" type="button" data-copy-target="overviewBaseUrlText">复制</button>
+          </div>
+          <div class="endpoint-hints">
+            <span>Claude 原生：<code>/v1/messages</code></span>
+            <span>Gemini 原生：<code>/v1beta/models/{model}:generateContent</code></span>
+          </div>
+        </section>
 
         <div class="overview-grid">
           <div class="overview-main">
@@ -253,6 +269,60 @@ for chunk in response:
           <input id="defaultModel" autocomplete="off" placeholder="gpt-4o" />
         </label>
 
+        <div class="protocol-builder" aria-label="按协议添加 API">
+          <button class="protocol-card" type="button" data-add-protocol="openai">
+            <strong>OpenAI 协议</strong>
+            <span>/v1/chat/completions、/v1/responses</span>
+          </button>
+          <button class="protocol-card" type="button" data-add-protocol="claude">
+            <strong>Claude 原生</strong>
+            <span>/v1/messages，使用 x-api-key</span>
+          </button>
+          <button class="protocol-card" type="button" data-add-protocol="gemini">
+            <strong>Gemini 原生</strong>
+            <span>/v1beta/models/{model}:generateContent</span>
+          </button>
+          <button class="protocol-card" type="button" data-add-protocol="domestic">
+            <strong>国内大模型</strong>
+            <span>DeepSeek / Qwen / GLM 等 OpenAI 兼容入口</span>
+          </button>
+        </div>
+
+        <section class="preset-panel" aria-label="常用供应商模板">
+          <div class="preset-head">
+            <div>
+              <h3>常用模板</h3>
+              <p>一键填入常见服务商的协议、Base URL 和默认模型；密钥仍只在本地填写保存。</p>
+            </div>
+          </div>
+          <div class="preset-grid">
+            <button class="preset-card" type="button" data-add-preset="openai">
+              <strong>OpenAI</strong>
+              <span>官方 OpenAI API</span>
+            </button>
+            <button class="preset-card" type="button" data-add-preset="deepseek">
+              <strong>DeepSeek</strong>
+              <span>国内兼容入口</span>
+            </button>
+            <button class="preset-card" type="button" data-add-preset="qwen">
+              <strong>通义千问</strong>
+              <span>DashScope 兼容模式</span>
+            </button>
+            <button class="preset-card" type="button" data-add-preset="glm">
+              <strong>智谱 GLM</strong>
+              <span>BigModel OpenAI 兼容</span>
+            </button>
+            <button class="preset-card" type="button" data-add-preset="claude">
+              <strong>Claude</strong>
+              <span>Anthropic 原生协议</span>
+            </button>
+            <button class="preset-card" type="button" data-add-preset="gemini">
+              <strong>Gemini</strong>
+              <span>Google 原生协议</span>
+            </button>
+          </div>
+        </section>
+
         <div class="channel-overview" aria-label="渠道概览">
           <div class="channel-overview-head">
             <div>
@@ -412,6 +482,6 @@ for chunk in response:
       </article>
     </template>
 
-    <script src="/static/app.js" defer></script>
+    <script src="/static/app.js?v=20260620-ui7" defer></script>
   </body>
 </html>

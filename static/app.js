@@ -37,14 +37,114 @@ const syncModelsBtn = document.querySelector("#syncModelsBtn");
 let providers = [];
 let latestRequests = [];
 let latestSecurity = {};
+let protocolCatalog = {};
+let activeProviderName = "";
 localProxyTokenInput.value = localStorage.getItem("gpt_proxy_access_token") || "";
 
 const protocolLabels = {
   openai: "OpenAI",
-  domestic: "国内",
+  domestic: "国内大模型",
   claude: "Claude",
   gemini: "Gemini",
 };
+
+const protocolDefaults = {
+  openai: {
+    group: "OpenAI 协议",
+    default_base_url: "https://api.openai.com/v1",
+    default_model: "gpt-4o",
+    chat_endpoint: "/v1/chat/completions",
+    description: "适合 OpenAI 官方，以及完整兼容 OpenAI API 的服务。",
+  },
+  domestic: {
+    group: "国内 OpenAI 兼容",
+    default_base_url: "https://api.deepseek.com/v1",
+    default_model: "deepseek-chat",
+    chat_endpoint: "/v1/chat/completions",
+    description: "适合 DeepSeek、通义千问兼容模式、智谱等 OpenAI 兼容入口。",
+  },
+  claude: {
+    group: "Claude 原生协议",
+    default_base_url: "https://api.anthropic.com/v1",
+    default_model: "claude-sonnet-4-20250514",
+    chat_endpoint: "/v1/messages",
+    description: "适合 Anthropic Claude Messages API，使用 Claude 原生请求体。",
+  },
+  gemini: {
+    group: "Gemini 原生协议",
+    default_base_url: "https://generativelanguage.googleapis.com/v1beta",
+    default_model: "gemini-2.0-flash",
+    chat_endpoint: "/v1beta/models/{model}:generateContent",
+    description: "适合 Google Gemini API，使用 contents/parts 原生格式。",
+  },
+};
+
+const providerPresets = {
+  openai: {
+    name: "openai-official",
+    protocol: "openai",
+    base_url: "https://api.openai.com/v1",
+    model: "gpt-4o",
+    priority: 0,
+    model_aliases: {
+      "gpt-4": "gpt-4o",
+      "gpt-3.5-turbo": "gpt-4o-mini",
+    },
+  },
+  deepseek: {
+    name: "deepseek",
+    protocol: "domestic",
+    base_url: "https://api.deepseek.com/v1",
+    model: "deepseek-chat",
+    priority: 10,
+    model_aliases: {
+      "gpt-4o": "deepseek-chat",
+      "gpt-3.5-turbo": "deepseek-chat",
+    },
+  },
+  qwen: {
+    name: "qwen",
+    protocol: "domestic",
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    model: "qwen-max",
+    priority: 20,
+    model_aliases: {
+      "gpt-4o": "qwen-max",
+      "gpt-3.5-turbo": "qwen-plus",
+    },
+  },
+  glm: {
+    name: "glm",
+    protocol: "domestic",
+    base_url: "https://open.bigmodel.cn/api/paas/v4",
+    model: "glm-4-plus",
+    priority: 30,
+    model_aliases: {
+      "gpt-4o": "glm-4-plus",
+      "gpt-3.5-turbo": "glm-4-flash",
+    },
+  },
+  claude: {
+    name: "claude-official",
+    protocol: "claude",
+    base_url: "https://api.anthropic.com/v1",
+    model: "claude-sonnet-4-20250514",
+    priority: 40,
+    model_aliases: {},
+  },
+  gemini: {
+    name: "gemini-official",
+    protocol: "gemini",
+    base_url: "https://generativelanguage.googleapis.com/v1beta",
+    model: "gemini-2.0-flash",
+    priority: 50,
+    model_aliases: {},
+  },
+};
+
+function protocolInfo(protocol) {
+  return protocolCatalog[protocol] || protocolDefaults[protocol] || protocolDefaults.openai;
+}
 
 const viewCopy = {
   overview: {
@@ -86,6 +186,43 @@ function setMessage(text, type = "") {
 
 function providerDomId(index) {
   return `provider-card-${index}`;
+}
+
+function providerSelectionName(provider) {
+  return String(provider?._savedName || provider?.name || "").trim();
+}
+
+function activeProviderIndex() {
+  if (!activeProviderName) return -1;
+  return providers.findIndex((provider) => providerSelectionName(provider) === activeProviderName);
+}
+
+function selectProvider(index, scroll = true) {
+  const provider = providers[index];
+  activeProviderName = providerSelectionName(provider);
+  renderProviders();
+  if (scroll && activeProviderName) {
+    document.querySelector(`#${providerDomId(activeProviderIndex())}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+function markSavedProviders(items) {
+  return (items || []).map((provider) => ({
+    ...provider,
+    _savedName: provider.name || "",
+  }));
+}
+
+function savedKeyCount(provider) {
+  return Number(provider.key_count || 0) || (provider.has_api_key ? 1 : 0);
+}
+
+function keyTextareaPlaceholder(provider) {
+  const count = savedKeyCount(provider);
+  if (provider.has_api_key && !provider.api_keys_text) {
+    return `已保存 ${count} 个密钥；出于安全不会显示原文。\n留空保存 = 继续保留；输入新 key = 替换。`;
+  }
+  return "sk-xxxx\nsk-yyyy";
 }
 
 function setActiveView(viewName, updateHash = true) {
@@ -201,18 +338,19 @@ function renderOverviewProtocols(protocols = null) {
   const counts = protocols || fallbackProtocolCounts();
   overviewProtocolList.innerHTML = "";
 
-  Object.entries(protocolLabels).forEach(([protocol, label]) => {
+  Object.keys(protocolDefaults).forEach((protocol) => {
+    const info = protocolInfo(protocol);
     const item = document.createElement("div");
     item.className = "protocol-item";
 
     const name = document.createElement("span");
-    name.textContent = label;
+    name.textContent = info.group || protocolLabels[protocol] || protocol;
 
     const count = document.createElement("strong");
     count.textContent = Number(counts[protocol] || 0).toLocaleString("zh-CN");
 
     const hint = document.createElement("small");
-    hint.textContent = Number(counts[protocol] || 0) > 0 ? "已配置" : "未配置";
+    hint.textContent = Number(counts[protocol] || 0) > 0 ? info.chat_endpoint : "未配置";
 
     item.append(name, count, hint);
     overviewProtocolList.appendChild(item);
@@ -309,9 +447,11 @@ function renderChannelOverview() {
     const button = document.createElement("button");
     button.className = "ghost-link";
     button.type = "button";
-    button.textContent = "编辑";
+    const isActive = providerSelectionName(provider) === activeProviderName;
+    button.textContent = isActive ? "正在编辑" : "编辑";
+    button.classList.toggle("active", isActive);
     button.addEventListener("click", () => {
-      document.querySelector(`#${providerDomId(index)}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      selectProvider(index);
     });
     actionCell.appendChild(button);
     row.appendChild(actionCell);
@@ -322,8 +462,22 @@ function renderChannelOverview() {
 
 function renderProviders() {
   providerList.innerHTML = "";
-  providers.forEach((provider, index) => {
-    if (provider.enabled === undefined) provider.enabled = true;
+  const selectedIndex = activeProviderIndex();
+  if (selectedIndex === -1) {
+    const empty = document.createElement("div");
+    empty.className = "editor-empty";
+    empty.innerHTML = providers.length
+      ? "<strong>选择一个 API 编辑</strong><span>点击上方渠道列表里的“编辑”，这里才会展开完整配置。</span>"
+      : "<strong>还没有 API</strong><span>点击“添加 API”后会自动打开编辑表单。</span>";
+    providerList.appendChild(empty);
+    renderChannelOverview();
+    refreshSummary();
+    return;
+  }
+
+  const provider = providers[selectedIndex];
+  const index = selectedIndex;
+  if (provider.enabled === undefined) provider.enabled = true;
 
     const node = providerTemplate.content.firstElementChild.cloneNode(true);
     node.dataset.index = index;
@@ -336,6 +490,8 @@ function renderProviders() {
       const field = input.dataset.field;
       if (field === "api_keys_text") {
         input.value = provider.api_keys_text || "";
+        input.placeholder = keyTextareaPlaceholder(provider);
+        input.classList.toggle("saved-secret-placeholder", Boolean(provider.has_api_key && !provider.api_keys_text));
       } else if (input.type === "checkbox") {
         input.checked = Boolean(provider[field]);
       } else if (input.tagName === "SELECT") {
@@ -343,7 +499,7 @@ function renderProviders() {
       } else {
         input.value = provider[field] ?? "";
       }
-      input.addEventListener("input", () => {
+      input.addEventListener(input.tagName === "SELECT" ? "change" : "input", () => {
         if (field === "api_keys_text") {
           providers[index][field] = input.value;
           providers[index].key_count = input.value.split(/\r?\n/).filter((key) => key.trim()).length || provider.key_count || 0;
@@ -351,8 +507,25 @@ function renderProviders() {
           providers[index][field] = input.checked;
         } else if (field === "priority") {
           providers[index][field] = Number(input.value || 0);
+        } else if (field === "protocol") {
+          const previousProtocol = providers[index][field] || "openai";
+          const previousInfo = protocolInfo(previousProtocol);
+          const nextInfo = protocolInfo(input.value);
+          providers[index][field] = input.value;
+
+          if (!providers[index].base_url || providers[index].base_url === previousInfo.default_base_url || providers[index].base_url === "https://example.com/v1") {
+            providers[index].base_url = nextInfo.default_base_url || "";
+            node.querySelector('[data-field="base_url"]').value = providers[index].base_url;
+          }
+          if (!providers[index].model || providers[index].model === previousInfo.default_model) {
+            providers[index].model = nextInfo.default_model || "";
+            node.querySelector('[data-field="model"]').value = providers[index].model;
+          }
         } else {
           providers[index][field] = input.value;
+        }
+        if (field === "name" && !providers[index]._savedName) {
+          activeProviderName = String(providers[index].name || "").trim();
         }
         node.querySelector(".provider-title").textContent = providers[index].name || "新 API";
         node.querySelector(".provider-meta").textContent = providerMeta(providers[index]);
@@ -363,9 +536,7 @@ function renderProviders() {
     }
 
     node.querySelector(".remove-provider").addEventListener("click", () => {
-      providers.splice(index, 1);
-      renderProviders();
-      refreshSummary();
+      deleteProvider(index, node).catch(() => {});
     });
 
     node.querySelector(".test-provider").addEventListener("click", () => {
@@ -387,7 +558,6 @@ function renderProviders() {
     });
 
     providerList.appendChild(node);
-  });
   renderChannelOverview();
   refreshSummary();
 }
@@ -432,16 +602,25 @@ async function fetchJson(url, options = {}) {
 
 async function loadConfig() {
   setMessage("正在读取配置...");
-  const [health, detailedHealth, config] = await Promise.all([
+  const [health, detailedHealth, protocolData, config] = await Promise.all([
     fetchJson("/health").catch(() => null),
     fetchJson("/health/detailed").catch(() => null),
+    fetchJson("/api/protocols").catch(() => null),
     fetchJson("/api/config"),
   ]);
 
+  protocolCatalog = Object.fromEntries(
+    (protocolData?.protocols || [])
+      .filter((item) => item.name)
+      .map((item) => [item.name, item])
+  );
+  if (!Object.keys(protocolCatalog).length && detailedHealth?.protocol_catalog) {
+    protocolCatalog = detailedHealth.protocol_catalog;
+  }
   healthBadge.textContent = health ? "服务正常" : "服务异常";
   healthBadge.className = health ? "badge" : "badge muted";
   defaultModelInput.value = config.default_model || "gpt-4o";
-  providers = config.providers || [];
+  providers = markSavedProviders(config.providers);
   renderSecurity(config.security);
   renderProviders();
   renderOverviewProtocols(detailedHealth?.protocols);
@@ -483,6 +662,8 @@ function collectPayload() {
 
 async function saveConfig() {
   setMessage("正在保存...");
+  const selectedIndex = activeProviderIndex();
+  const selectedName = selectedIndex >= 0 ? String(providers[selectedIndex].name || "").trim() : activeProviderName;
   try {
     const config = await fetchJson("/api/config", {
       method: "POST",
@@ -490,13 +671,80 @@ async function saveConfig() {
       body: JSON.stringify(collectPayload()),
     });
     defaultModelInput.value = config.default_model;
-    providers = config.providers || [];
+    providers = markSavedProviders(config.providers);
+    if (selectedName && providers.some((provider) => providerSelectionName(provider) === selectedName || provider.name === selectedName)) {
+      activeProviderName = selectedName;
+    } else if (activeProviderName && !providers.some((provider) => providerSelectionName(provider) === activeProviderName)) {
+      activeProviderName = "";
+    }
     renderSecurity(config.security);
     renderProviders();
     setMessage("已保存，下一次请求会使用新配置", "ok");
     return config;
   } catch (error) {
     setMessage(error.message, "error");
+    throw error;
+  }
+}
+
+async function saveProviderBeforeAction(index) {
+  const originalProvider = providers[index];
+  const originalName = String(originalProvider?.name || "").trim();
+  if (!originalName) {
+    setMessage("请先填写 API 名称", "error");
+    return null;
+  }
+
+  await saveConfig();
+  activeProviderName = originalName;
+  const savedIndex = providers.findIndex((provider) => provider._savedName === originalName || provider.name === originalName);
+  if (savedIndex === -1) {
+    throw new Error(`Provider '${originalName}' does not exist in config`);
+  }
+  renderProviders();
+
+  return {
+    index: savedIndex,
+    provider: providers[savedIndex],
+    node: document.querySelector(`#${providerDomId(savedIndex)}`),
+  };
+}
+
+async function deleteProvider(index, node) {
+  const provider = providers[index];
+  if (!provider) return;
+
+  const savedName = String(provider._savedName || "").trim();
+  const displayName = String(provider.name || savedName || "这个 API").trim();
+  const confirmed = window.confirm(`确定删除「${displayName}」吗？已保存的 API 会立即从 config.json 中移除。`);
+  if (!confirmed) return;
+
+  const button = node.querySelector(".remove-provider");
+  button.disabled = true;
+  button.textContent = "删除中";
+
+  try {
+    if (!savedName) {
+      providers.splice(index, 1);
+      renderProviders();
+      refreshSummary();
+      setMessage(`已移除未保存的「${displayName}」`, "ok");
+      return;
+    }
+
+    const config = await fetchJson(`/api/providers/${encodeURIComponent(savedName)}`, {
+      method: "DELETE",
+    });
+    defaultModelInput.value = config.default_model;
+    providers = markSavedProviders(config.providers);
+    activeProviderName = "";
+    renderSecurity(config.security);
+    renderProviders();
+    setMessage(`已删除「${savedName}」并保存配置`, "ok");
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "删除";
+    setMessage(`删除失败：${error.message}`, "error");
     throw error;
   }
 }
@@ -659,7 +907,8 @@ async function importConfig(file) {
       body: JSON.stringify(payload),
     });
     defaultModelInput.value = config.default_model;
-    providers = config.providers || [];
+    providers = markSavedProviders(config.providers);
+    activeProviderName = "";
     renderSecurity(config.security);
     renderProviders();
     setMessage("配置已导入并保存", "ok");
@@ -679,19 +928,31 @@ function formatCheckDetail(detail) {
 }
 
 async function testProvider(index, node) {
-  const provider = providers[index];
-  if (!provider?.name) {
-    setMessage("请先填写 API 名称并保存", "error");
+  const originalProvider = providers[index];
+  if (!originalProvider?.name) {
+    setMessage("请先填写 API 名称", "error");
     return;
   }
 
-  const button = node.querySelector(".test-provider");
-  const meta = node.querySelector(".provider-meta");
+  let button = node.querySelector(".test-provider");
+  let meta = node.querySelector(".provider-meta");
+  let activeProvider = originalProvider;
   button.disabled = true;
-  button.textContent = "测试中";
-  meta.textContent = "正在请求该 API...";
+  button.textContent = "保存中";
+  meta.textContent = "正在保存当前 API...";
 
   try {
+    const saved = await saveProviderBeforeAction(index);
+    if (!saved) return;
+    const provider = saved.provider;
+    activeProvider = provider;
+    node = saved.node || node;
+    button = node.querySelector(".test-provider");
+    meta = node.querySelector(".provider-meta");
+    button.disabled = true;
+    button.textContent = "测试中";
+    meta.textContent = "正在请求该 API...";
+
     const result = await fetchJson(`/api/providers/${encodeURIComponent(provider.name)}/check`, {
       method: "POST",
     });
@@ -707,7 +968,7 @@ async function testProvider(index, node) {
     meta.className = result.ok ? "provider-meta ok" : "provider-meta error";
     setMessage(result.ok ? `${provider.name} 连接正常` : `${provider.name} 连接失败`, result.ok ? "ok" : "error");
   } catch (error) {
-    meta.textContent = `${providerMeta(provider)} · 测试失败：${error.message}`;
+    meta.textContent = `${providerMeta(activeProvider)} · 测试失败：${error.message}`;
     meta.className = "provider-meta error";
     setMessage(error.message, "error");
   } finally {
@@ -763,22 +1024,44 @@ function renderAliases(aliasList, index) {
 }
 
 async function fetchModels(index, node) {
-  const provider = providers[index];
-  if (!provider?.name) {
-    setMessage("请先填写 API 名称并保存", "error");
+  const originalProvider = providers[index];
+  if (!originalProvider?.name) {
+    setMessage("请先填写 API 名称", "error");
     return;
   }
 
-  const button = node.querySelector(".fetch-models");
-  const dropdown = node.querySelector(".model-dropdown");
-  const modelInput = node.querySelector('[data-field="model"]');
+  let button = node.querySelector(".fetch-models");
+  let dropdown = node.querySelector(".model-dropdown");
+  let modelInput = node.querySelector('[data-field="model"]');
   button.disabled = true;
-  button.textContent = "获取中";
+  button.textContent = "保存中";
   dropdown.hidden = true;
   dropdown.innerHTML = "";
 
   try {
+    const saved = await saveProviderBeforeAction(index);
+    if (!saved) return;
+    const provider = saved.provider;
+    index = saved.index;
+    node = saved.node || node;
+    button = node.querySelector(".fetch-models");
+    dropdown = node.querySelector(".model-dropdown");
+    modelInput = node.querySelector('[data-field="model"]');
+    button.disabled = true;
+    button.textContent = "获取中";
+    dropdown.hidden = true;
+    dropdown.innerHTML = "";
+
     const data = await fetchJson(`/api/providers/${encodeURIComponent(provider.name)}/models`);
+    if (data.status === "no_api_key") {
+      const empty = document.createElement("div");
+      empty.className = "model-empty";
+      empty.textContent = data.detail || "请先填写 API Key 后再获取模型";
+      dropdown.appendChild(empty);
+      dropdown.hidden = false;
+      setMessage(`${provider.name} 还没有可用密钥`, "error");
+      return;
+    }
     const models = data.models?.data || [];
     if (models.length === 0) {
       const empty = document.createElement("div");
@@ -933,12 +1216,13 @@ async function loadRequests() {
   }
 }
 
-function addProvider() {
-  providers.push({
-    name: `provider-${providers.length + 1}`,
-    protocol: "openai",
-    base_url: "https://example.com/v1",
-    model: "",
+function addProvider(protocol = "openai") {
+  const info = protocolInfo(protocol);
+  const provider = {
+    name: nextProviderName(`provider-${providers.length + 1}`),
+    protocol,
+    base_url: info.default_base_url || "https://example.com/v1",
+    model: info.default_model || "",
     priority: providers.length,
     api_keys_text: "",
     api_key_env: "",
@@ -949,8 +1233,42 @@ function addProvider() {
     model_aliases: {},
     calls: 0,
     last_remaining: null,
-  });
+  };
+  providers.push(provider);
+  activeProviderName = provider.name;
   renderProviders();
+}
+
+function nextProviderName(baseName) {
+  const base = String(baseName || "provider").trim() || "provider";
+  const usedNames = new Set(providers.map((provider) => String(provider.name || provider._savedName || "").trim()));
+  if (!usedNames.has(base)) return base;
+  let suffix = 2;
+  while (usedNames.has(`${base}-${suffix}`)) suffix += 1;
+  return `${base}-${suffix}`;
+}
+
+function addProviderPreset(presetName) {
+  const preset = providerPresets[presetName];
+  if (!preset) return addProvider();
+  const provider = {
+    ...preset,
+    name: nextProviderName(preset.name),
+    api_keys_text: "",
+    api_key_env: "",
+    has_api_key: false,
+    key_count: 0,
+    enabled: true,
+    use_curl: false,
+    model_aliases: { ...(preset.model_aliases || {}) },
+    calls: 0,
+    last_remaining: null,
+  };
+  providers.push(provider);
+  activeProviderName = provider.name;
+  renderProviders();
+  setActiveView("providers");
+  setMessage(`已添加 ${provider.name} 模板，请填写 API Key 后保存`, "ok");
 }
 
 async function copyText(targetId) {
@@ -984,7 +1302,18 @@ document.addEventListener("click", (event) => {
   }
 });
 
-document.querySelector("#addProviderBtn").addEventListener("click", addProvider);
+document.querySelector("#addProviderBtn").addEventListener("click", () => addProvider());
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-add-protocol]");
+  if (!button) return;
+  addProvider(button.dataset.addProtocol || "openai");
+  setActiveView("providers");
+});
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-add-preset]");
+  if (!button) return;
+  addProviderPreset(button.dataset.addPreset);
+});
 document.querySelector("#saveBtn").addEventListener("click", () => {
   saveConfig().catch(() => {});
 });

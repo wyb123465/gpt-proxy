@@ -5,9 +5,23 @@ $escapedDir = [regex]::Escape($scriptDir)
 
 $procs = Get-CimInstance Win32_Process |
     Where-Object {
-        $_.CommandLine -match "uvicorn main:app" -and
+        $_.CommandLine -match "uvicorn" -and
+        $_.CommandLine -match "main:app" -and
         $_.CommandLine -match $escapedDir
     }
+
+$portProcs = Get-NetTCPConnection -LocalPort 8000 -State Listen |
+    ForEach-Object {
+        Get-CimInstance Win32_Process -Filter "ProcessId=$($_.OwningProcess)"
+    } |
+    Where-Object {
+        $_.CommandLine -match "uvicorn" -and
+        $_.CommandLine -match "main:app"
+    }
+
+$procs = @($procs + $portProcs) |
+    Where-Object { $_ -and $_.ProcessId } |
+    Sort-Object ProcessId -Unique
 
 if (-not $procs) {
     Write-Host "No running GPT Proxy process found."

@@ -1,36 +1,30 @@
 # Local GPT API Proxy
 
-这是一个本地 OpenAI 兼容代理。你的程序只需要调用本地地址，代理会按优先级自动尝试多个后端 API，并在额度耗尽或后端错误时回退到下一个 Key 或 provider。
+一个轻量、本地优先的多供应商 API 代理。你可以把多个 API Key 集中配置到本机，然后让 OpenAI 兼容客户端统一调用 `http://127.0.0.1:8000/v1`。
+
+项目重点不是做“大而全平台”，而是解决个人本地使用时最麻烦的三件事：
+
+- 多个 API 自动按优先级回退。
+- 同一个供应商多个 Key 自动轮询。
+- 在 UI 中管理配置、测试连通性、查看请求日志。
 
 ## 已支持能力
 
-### 多协议支持
-- ✅ **OpenAI 兼容接口**：`POST /v1/chat/completions`、`POST /v1/responses`
-- ✅ **Claude 原生接口**：`POST /v1/messages`（支持 Anthropic API）
-- ✅ **Gemini 原生接口**：`POST /v1beta/models/{model}:generateContent`（支持 Google Gemini API）
-- ✅ **国内大模型接口**：支持通义千问、智谱GLM、DeepSeek、百川、豆包、混元等（OpenAI 兼容格式）
+- **OpenAI 兼容接口**：`POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models`
+- **Claude 原生接口**：`POST /v1/messages`
+- **Gemini 原生接口**：`POST /v1beta/models/{model}:generateContent`
+- **国内大模型**：DeepSeek、通义千问兼容模式、智谱 GLM 等 OpenAI 兼容入口
+- **自动回退**：遇到 `403`、`429`、`5xx` 或网络错误时尝试下一个 Key / provider
+- **流式输出**：支持 `stream: true`，原样透传 SSE
+- **多 Key 轮询**：成功调用后自动切换到下一个 Key，`429` 后进入冷却
+- **模型获取**：可在 UI 中获取单个 provider 模型，也可批量同步
+- **请求日志**：显示 provider、状态码、耗时、回退次数、流式状态和错误摘要
+- **安全选项**：本地访问 Token、请求限流、请求体大小限制、配置密钥加密
+- **Web 管理台**：添加、编辑、删除、导入、导出、测试 API 配置
 
-### 核心功能
-- 🔄 **自动回退**：遇到 `403`、`429`、`5xx` 会尝试下一个 Key 或下一个 API
-- 🔁 **多 Key 轮询**：同一个 provider 可配置多个 API Key，成功后自动轮到下一个
-- ❄️ **429 冷却**：某个 Key 触发 429 后会暂时跳过它
-- 📊 **模型列表聚合**：`GET /v1/models` 聚合所有后端的可用模型
-- 🌊 **流式输出**：支持客户端传 `stream: true`
-- 🔀 **模型别名**：客户端请求 `gpt-4o`，后端可转成真实模型名，例如 `deepseek-chat`
-- 🧪 **配置体检**：UI 可批量检查 API 连通性、密钥状态和失败原因
-- 🧭 **批量模型同步**：一键获取所有可用 provider 的模型列表并去重汇总
-- 🎯 **请求日志**：UI 显示最近请求的 provider、状态码、耗时、回退次数和流式状态
-- 🎨 **Web 管理界面**：统一管理多个 API，支持启停、导入/导出配置
+> 说明：本项目不做 OpenAI / Claude / Gemini 之间的协议转换。不同协议使用各自原生端点。
 
-### 安全特性
-- 🔒 **代理访问密钥**：保护本地代理不被未授权访问
-- 🚦 **本地限流**：防止客户端滥用
-- 📏 **请求体大小限制**：防止超大请求
-- 🔐 **配置密钥加密**：API Key 加密存储到 `config.json`
-
-## 启动
-
-推荐使用 `uv`，不污染全局 Python 环境：
+## 快速启动（推荐 uv）
 
 ```powershell
 cd C:\Users\lenovo\Desktop\zhongzhuan\gpt-proxy
@@ -39,62 +33,29 @@ uv sync
 uv run uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-之后再次启动时，只需要执行最后一行 `uv run uvicorn main:app --host 127.0.0.1 --port 8000`。
-
-或者直接运行脚本：
-
-```powershell
-.\start.ps1   # 启动服务
-.\stop.ps1    # 停止服务
-```
-
-Windows 上想双击启动并自动打开管理台，可以运行：
-
-```powershell
-.\start-ui.bat
-```
-
-启动后打开管理台：
+启动后打开：
 
 ```text
 http://127.0.0.1:8000/
 ```
 
-## 可选安全环境变量
+Windows 上也可以双击：
 
-```powershell
-$env:GPT_PROXY_ACCESS_TOKEN="your-local-proxy-token"
-$env:GPT_PROXY_RATE_LIMIT_PER_MINUTE="60"
-$env:GPT_PROXY_MAX_REQUEST_BYTES="2097152"
-$env:GPT_PROXY_KEY_COOLDOWN_SECONDS="60"
-$env:GPT_PROXY_CONFIG_SECRET="your-config-encryption-passphrase"
+- `start-ui.bat`：启动服务并打开管理台
+- `stop.bat`：停止本项目占用的服务进程
+
+## 本机统一调用方式
+
+OpenAI 兼容客户端（Codex++、ChatBox、OpenAI SDK 等）一般填写：
+
+```text
+Base URL: http://127.0.0.1:8000/v1
+API Key: local-proxy
 ```
 
-- `GPT_PROXY_ACCESS_TOKEN`：启用后，调用 `/v1/*` 和管理接口 `/api/*` 都需要 `Authorization: Bearer <token>` 或 `x-api-key: <token>`。
-- `GPT_PROXY_RATE_LIMIT_PER_MINUTE`：本地代理每分钟请求限制，`0` 表示关闭。
-- `GPT_PROXY_MAX_REQUEST_BYTES`：请求体大小限制，默认 `2 MB`。
-- `GPT_PROXY_KEY_COOLDOWN_SECONDS`：Key 返回 `429` 后冷却秒数。
-- `GPT_PROXY_CONFIG_SECRET`：启用后写入 `config.json` 的 API Key 会加密保存；忘记设置该值时无法读取已加密配置。
+如果设置了 `GPT_PROXY_ACCESS_TOKEN`，这里的 API Key 要填你的本地代理访问密钥。
 
-## 在 UI 中配置 API
-
-打开 `http://127.0.0.1:8000/` 后可以直接添加、删除、启停、保存、导入和导出 API：
-
-- 如果启用了 `GPT_PROXY_ACCESS_TOKEN`，先在页面“安全与兼容”区域填写本地代理访问密钥。
-- `名称`：随便起，例如 `official`、`free-1`。
-- `Base URL`：服务商给你的 OpenAI 兼容地址，例如 `https://api.example.com/v1`。
-- `模型`：该服务商真实支持的模型；也可以点击“获取模型”后选择。
-- `优先级`：数字越小越先使用，质量好的 API 建议填 `0`。
-- `API Keys`：每行一个 Key；保存后 UI 不会回显，留空保存会保留旧密钥。
-- `启用该 API`：关闭后代理不会使用它，但配置仍保留。
-- `使用 curl 传输`：遇到 Cloudflare 保护导致 `httpx` 不通时可尝试开启。
-- `模型别名`：左边填客户端发来的模型名，右边填该站点真实模型名。
-- `保存并测试全部`：保存当前配置后逐个测试已启用 provider，并在页面顶部显示通过数量。
-- `配置体检`：集中查看配置摘要、批量连通性检测和模型同步报告。
-
-## 统一调用方式
-
-Python OpenAI SDK：
+Python 示例：
 
 ```python
 from openai import OpenAI
@@ -114,198 +75,102 @@ for chunk in response:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-如果设置了 `GPT_PROXY_ACCESS_TOKEN`，这里的 `api_key` 要改成你的本地代理访问密钥。
+## 协议与端点
 
-其他软件里把 API 地址改成：
+| 类型 | 本机端点 | 适用场景 |
+| --- | --- | --- |
+| OpenAI / 国内兼容 | `/v1/chat/completions` | OpenAI SDK、DeepSeek、Qwen 兼容模式、GLM 兼容模式 |
+| OpenAI Responses | `/v1/responses` | OpenAI Responses API |
+| Claude 原生 | `/v1/messages` | Anthropic Claude Messages API |
+| Gemini 原生 | `/v1beta/models/{model}:generateContent` | Google Gemini API |
 
-```text
-http://127.0.0.1:8000/v1
-```
+## UI 配置建议
 
-## 状态接口
+打开 `http://127.0.0.1:8000/` 后，在「API 配置」中：
 
-```powershell
-Invoke-WebRequest http://127.0.0.1:8000/api/providers -UseBasicParsing
-Invoke-WebRequest http://127.0.0.1:8000/api/requests -UseBasicParsing
-Invoke-WebRequest http://127.0.0.1:8000/v1/models -UseBasicParsing
-```
+1. 点击「常用模板」或「按协议添加 API」。
+2. 填写 `Base URL` 和 `API Keys`，多个 Key 每行一个。
+3. 模型可以手填，也可以点击「获取模型」后选择。
+4. 优先级数字越小越先用，质量更高或更稳定的 API 建议排前面。
+5. 点击「保存配置」或「保存并测试全部」。
 
-如果启用了 `GPT_PROXY_ACCESS_TOKEN`，这些请求也需要带本地代理访问密钥。
+配置保存后，API Key 不会在页面回显；留空保存会保留旧密钥，输入新 Key 会替换旧密钥。
 
-## 配置文件
-
-本地真实配置写在 `config.json`，它已被 `.gitignore` 忽略，不会上传密钥。公开模板是 `config.example.json`。
-
-### 四种协议配置说明
-
-代理支持四种协议类型，每种协议有不同的调用端点和认证方式：
-
-#### 1. OpenAI 协议 (`protocol: "openai"`)
-
-适用于 OpenAI 官方 API 和第三方兼容 API。
-
-```json
-{
-  "name": "openai-official",
-  "protocol": "openai",
-  "base_url": "https://api.openai.com/v1",
-  "model": "gpt-4o",
-  "priority": 0,
-  "enabled": true,
-  "api_keys": ["sk-your-openai-key"],
-  "model_aliases": {
-    "gpt-4": "gpt-4o"
-  }
-}
-```
-
-**调用端点**：
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-
-**认证方式**：`Authorization: Bearer {api_key}`
-
-#### 2. Claude 协议 (`protocol: "claude"`)
-
-适用于 Anthropic Claude 官方 API。
-
-```json
-{
-  "name": "claude-official",
-  "protocol": "claude",
-  "base_url": "https://api.anthropic.com/v1",
-  "model": "claude-sonnet-4-20250514",
-  "priority": 1,
-  "enabled": true,
-  "api_keys": ["sk-ant-your-claude-key"]
-}
-```
-
-**调用端点**：
-- `POST /v1/messages`
-
-**认证方式**：`x-api-key: {api_key}` + `anthropic-version: 2023-06-01`
-
-#### 3. Gemini 协议 (`protocol: "gemini"`)
-
-适用于 Google Gemini 官方 API。
-
-```json
-{
-  "name": "gemini-official",
-  "protocol": "gemini",
-  "base_url": "https://generativelanguage.googleapis.com/v1beta",
-  "model": "gemini-2.0-flash",
-  "priority": 2,
-  "enabled": true,
-  "api_keys": ["your-gemini-api-key"]
-}
-```
-
-**调用端点**：
-- `POST /v1beta/models/{model}:generateContent`
-- `POST /v1beta/models/{model}:streamGenerateContent`
-
-**认证方式**：`x-goog-api-key: {api_key}`
-
-#### 4. 国内大模型协议 (`protocol: "domestic"`)
-
-适用于国内主流大模型，使用 OpenAI 兼容格式，但可能有特定的认证或参数要求。
-
-**支持的国内大模型**：
-- 🚀 **DeepSeek**：`https://api.deepseek.com/v1`
-- 🌟 **通义千问（Qwen）**：`https://dashscope.aliyuncs.com/compatible-mode/v1`
-- 🤖 **智谱 GLM**：`https://open.bigmodel.cn/api/paas/v4`
-- 🎯 **百川（Baichuan）**
-- 🔥 **豆包（Doubao）**
-- ⚡ **腾讯混元（Hunyuan）**
-- 🌈 **零一万物（Yi）**
-
-**配置示例（DeepSeek）**：
-
-```json
-{
-  "name": "deepseek",
-  "protocol": "domestic",
-  "base_url": "https://api.deepseek.com/v1",
-  "model": "deepseek-chat",
-  "priority": 3,
-  "enabled": true,
-  "api_keys": ["sk-your-deepseek-key"],
-  "model_aliases": {
-    "gpt-3.5-turbo": "deepseek-chat",
-    "gpt-4": "deepseek-chat"
-  }
-}
-```
-
-**调用端点**：
-- `POST /v1/chat/completions`（通过代理统一调用）
-
-**认证方式**：`Authorization: Bearer {api_key}`
-
-### 完整配置示例
+## 常用供应商示例
 
 ```json
 {
   "providers": [
     {
-      "name": "openai-official",
-      "protocol": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "model": "gpt-4o",
-      "priority": 0,
-      "enabled": true,
-      "api_keys": ["sk-xxx", "sk-yyy"],
-      "use_curl": false,
-      "model_aliases": {
-        "gpt-4": "gpt-4o"
-      }
-    },
-    {
-      "name": "claude",
-      "protocol": "claude",
-      "base_url": "https://api.anthropic.com/v1",
-      "model": "claude-sonnet-4-20250514",
-      "priority": 1,
-      "enabled": true,
-      "api_keys": ["sk-ant-xxx"]
-    },
-    {
       "name": "deepseek",
       "protocol": "domestic",
       "base_url": "https://api.deepseek.com/v1",
       "model": "deepseek-chat",
-      "priority": 2,
+      "priority": 0,
       "enabled": true,
-      "api_keys": ["sk-xxx"]
+      "api_keys": ["sk-your-key"],
+      "model_aliases": {
+        "gpt-4o": "deepseek-chat",
+        "gpt-3.5-turbo": "deepseek-chat"
+      }
     }
   ],
   "default_model": "gpt-4o"
 }
 ```
 
-## Docker
+公开模板文件是 `config.example.json`。真实本地配置写入 `config.json`，该文件已被 `.gitignore` 忽略，不应提交到 GitHub。
 
-首次使用建议先创建空文件，避免 Docker 把挂载目标当成目录：
+## 可选安全环境变量
 
 ```powershell
-if (!(Test-Path .\config.json)) { Copy-Item .\config.example.json .\config.json }
-if (!(Test-Path .\state.json)) { Set-Content .\state.json "{}" -Encoding UTF8 }
-Copy-Item .\.env.example .\.env
+$env:GPT_PROXY_ACCESS_TOKEN="your-local-proxy-token"
+$env:GPT_PROXY_RATE_LIMIT_PER_MINUTE="60"
+$env:GPT_PROXY_MAX_REQUEST_BYTES="2097152"
+$env:GPT_PROXY_KEY_COOLDOWN_SECONDS="60"
+$env:GPT_PROXY_CONFIG_SECRET="your-config-encryption-passphrase"
 ```
 
-然后启动：
+- `GPT_PROXY_ACCESS_TOKEN`：保护 `/v1/*` 和 `/api/*`
+- `GPT_PROXY_RATE_LIMIT_PER_MINUTE`：本地每分钟请求限制，`0` 表示关闭
+- `GPT_PROXY_MAX_REQUEST_BYTES`：请求体大小限制，默认 `2 MB`
+- `GPT_PROXY_KEY_COOLDOWN_SECONDS`：Key 返回 `429` 后的冷却时间
+- `GPT_PROXY_CONFIG_SECRET`：启用后将 API Key 加密写入 `config.json`
+
+## Docker 可选部署
 
 ```powershell
-docker compose up --build -d
+copy config.example.json config.json
+New-Item state.json -ItemType File -Force
+docker compose up --build
 ```
 
-Docker 启动后打开 `http://127.0.0.1:8000/` 配置。`docker-compose.yml` 会把 `config.json` 和 `state.json` 挂载为可写文件，因此 UI 保存配置、导入配置和调用统计都能正常持久化。
+Docker 版本默认监听：
 
-## 测试
+```text
+http://127.0.0.1:8000/
+```
+
+`.dockerignore` 会排除 `config.json`、`state.json`、`.env` 等本地敏感文件，避免真实密钥被打进镜像。
+
+## 开发与测试
 
 ```powershell
-$env:UV_CACHE_DIR="C:\Users\lenovo\Desktop\zhongzhuan\gpt-proxy\.uv-cache"
+uv sync
 uv run python -m pytest -q -p no:cacheprovider
+node --check static\app.js
+```
+
+## 停止服务
+
+推荐双击 `stop.bat`。如果使用命令行：
+
+```powershell
+.\stop.ps1
+```
+
+如果端口仍被占用，可以检查：
+
+```powershell
+netstat -ano | findstr :8000
 ```

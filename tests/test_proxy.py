@@ -137,8 +137,27 @@ def test_provider_status_does_not_expose_api_keys(tmp_path, monkeypatch):
     provider = response.json()["providers"][0]
     assert provider["calls"] == 3
     assert provider["last_remaining"] == 4
+    assert provider["protocol"] == "openai"
     assert "api_key" not in provider
     assert "secret-key" not in response.text
+
+
+def test_protocol_catalog_endpoint_returns_four_groups(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0, api_key="secret-key")])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    client = TestClient(main.app)
+    response = client.get("/api/protocols")
+
+    assert response.status_code == 200
+    protocols = {item["name"]: item for item in response.json()["protocols"]}
+    assert set(protocols) == {"openai", "domestic", "claude", "gemini"}
+    assert protocols["openai"]["count"] == 1
+    assert protocols["claude"]["native_endpoint"] == "/v1/messages"
 
 
 def test_dashboard_config_masks_and_preserves_existing_key(tmp_path, monkeypatch):
@@ -179,6 +198,41 @@ def test_dashboard_config_masks_and_preserves_existing_key(tmp_path, monkeypatch
     assert saved["default_model"] == "new-default"
     assert saved["providers"][0]["api_key"] == "secret-key"
     assert saved["providers"][0]["model"] == "new-model"
+
+
+def test_dashboard_can_delete_provider_and_state(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            make_provider("official", 0, api_key="official-key"),
+            make_provider("free", 1, api_key="free-key"),
+        ],
+    )
+    state_path.write_text(
+        json.dumps(
+            {
+                "official": {"calls": 3, "last_remaining": 4},
+                "free": {"calls": 5, "last_remaining": 1},
+                "_requests": [{"provider": "free", "status": 200}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    client = TestClient(main.app)
+    response = client.delete("/api/providers/free")
+
+    assert response.status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert [provider["name"] for provider in saved["providers"]] == ["official"]
+    assert "free" not in state
+    assert state["_requests"] == [{"provider": "free", "status": 200}]
+    assert [provider["name"] for provider in response.json()["providers"]] == ["official"]
 
 
 def test_dashboard_config_can_replace_key(tmp_path, monkeypatch):
@@ -291,6 +345,24 @@ def test_provider_check_returns_no_api_key_when_key_missing(tmp_path, monkeypatc
 
     client = TestClient(main.app)
     response = client.post("/api/providers/free-1/check")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["provider"] == "free-1"
+    assert data["ok"] is False
+    assert data["status"] == "no_api_key"
+
+
+def test_provider_models_returns_no_api_key_when_key_missing(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [{"name": "free-1", "base_url": "https://free.example/v1", "priority": 1}])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    client = TestClient(main.app)
+    response = client.get("/api/providers/free-1/models")
 
     assert response.status_code == 200
     data = response.json()
@@ -729,6 +801,57 @@ def test_429_cools_down_key_for_next_request(tmp_path, monkeypatch):
     assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 200
 
     assert seen_auth == ["Bearer quota-key", "Bearer fresh-key", "Bearer fresh-key"]
+
+
+def test_key_rotation_uses_total_key_count_when_some_keys_are_cooled(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "free",
+                "base_url": "https://free.example/v1",
+                "priority": 0,
+                "api_keys": ["key-1", "key-2", "key-3"],
+            }
+        ],
+    )
+    state_path.write_text(
+        json.dumps(
+            {
+                "free": {
+                    "calls": 0,
+                    "key_index": 1,
+                    "key_cooldowns": {
+                        main.key_fingerprint("key-2"): 9999999999,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen_auth = []
+
+    def handler(request):
+        seen_auth.append(request.headers["authorization"])
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    assert client.post("/v1/chat/completions", json={"messages": []}).status_code == 200
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert seen_auth == ["Bearer key-3"]
+    assert state["free"]["key_index"] == 0
 
 
 def test_responses_endpoint_returns_response_shape(tmp_path, monkeypatch):
@@ -1232,3 +1355,61 @@ def test_provider_check_gemini_uses_generate_content(tmp_path, monkeypatch):
     assert "gemini-2.0-flash:generateContent" in seen["url"]
     assert seen["headers"].get("x-goog-api-key") == "gemini-test-key"
     assert "authorization" not in seen["headers"]
+
+
+def test_fetch_claude_models_uses_native_models_endpoint(monkeypatch):
+    provider = {
+        "name": "claude",
+        "protocol": "claude",
+        "base_url": "https://api.anthropic.com/v1",
+        "api_keys": ["claude-test-key"],
+    }
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"data": [{"id": "claude-sonnet-4-20250514"}]})
+
+    class MockAsyncClient(httpx.AsyncClient):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+
+    models = main.asyncio.run(main.fetch_provider_models(provider))
+
+    assert seen["url"] == "https://api.anthropic.com/v1/models"
+    assert seen["headers"]["x-api-key"] == "claude-test-key"
+    assert "authorization" not in seen["headers"]
+    assert models == [{"id": "claude-sonnet-4-20250514", "object": "model"}]
+
+
+def test_fetch_gemini_models_normalizes_model_names(monkeypatch):
+    provider = {
+        "name": "gemini",
+        "protocol": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "api_keys": ["gemini-test-key"],
+    }
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"models": [{"name": "models/gemini-2.0-flash"}]})
+
+    class MockAsyncClient(httpx.AsyncClient):
+        def __init__(self, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+
+    models = main.asyncio.run(main.fetch_provider_models(provider))
+
+    assert seen["url"] == "https://generativelanguage.googleapis.com/v1beta/models"
+    assert seen["headers"]["x-goog-api-key"] == "gemini-test-key"
+    assert "authorization" not in seen["headers"]
+    assert models == [{"id": "gemini-2.0-flash", "object": "model", "owned_by": "gemini"}]

@@ -11,6 +11,7 @@ __pycache__/
 .env
 state.json
 config.json
+data/
 
 # Editor / OS
 .DS_Store

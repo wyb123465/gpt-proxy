@@ -12,7 +12,54 @@ def _curl_bin() -> str:
     return shutil.which("curl") or "curl"
 
 
-VALID_PROTOCOLS = {"openai", "domestic", "claude", "gemini"}
+PROTOCOL_CATALOG: dict[str, dict[str, str]] = {
+    "openai": {
+        "label": "OpenAI",
+        "group": "OpenAI 协议",
+        "default_base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o",
+        "chat_endpoint": "/v1/chat/completions",
+        "native_endpoint": "/v1/responses",
+        "auth": "Authorization: Bearer",
+        "model_fetch": "GET /v1/models",
+        "description": "适合 OpenAI 官方，以及完整兼容 OpenAI API 的服务。",
+    },
+    "domestic": {
+        "label": "国内大模型",
+        "group": "国内 OpenAI 兼容",
+        "default_base_url": "https://api.deepseek.com/v1",
+        "default_model": "deepseek-chat",
+        "chat_endpoint": "/v1/chat/completions",
+        "native_endpoint": "/v1/chat/completions",
+        "auth": "Authorization: Bearer",
+        "model_fetch": "GET /v1/models（若服务商支持）",
+        "description": "适合 DeepSeek、通义千问兼容模式、智谱等 OpenAI 兼容入口。",
+    },
+    "claude": {
+        "label": "Claude",
+        "group": "Claude 原生协议",
+        "default_base_url": "https://api.anthropic.com/v1",
+        "default_model": "claude-sonnet-4-20250514",
+        "chat_endpoint": "/v1/messages",
+        "native_endpoint": "/v1/messages",
+        "auth": "x-api-key + anthropic-version",
+        "model_fetch": "GET /v1/models",
+        "description": "适合 Anthropic Claude Messages API，使用 Claude 原生请求体。",
+    },
+    "gemini": {
+        "label": "Gemini",
+        "group": "Gemini 原生协议",
+        "default_base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "default_model": "gemini-2.0-flash",
+        "chat_endpoint": "/v1beta/models/{model}:generateContent",
+        "native_endpoint": "/v1beta/models/{model}:generateContent",
+        "auth": "x-goog-api-key",
+        "model_fetch": "GET /v1beta/models",
+        "description": "适合 Google Gemini API，使用 contents/parts 原生格式。",
+    },
+}
+
+VALID_PROTOCOLS = set(PROTOCOL_CATALOG)
 ANTHROPIC_VERSION = "2023-06-01"
 GEMINI_API_VERSION = "v1beta"
 
@@ -33,6 +80,10 @@ DOMESTIC_PROVIDERS = {
 def provider_protocol(provider: dict[str, Any]) -> str:
     protocol = str(provider.get("protocol", "openai")).strip().lower() or "openai"
     return protocol if protocol in VALID_PROTOCOLS else "openai"
+
+
+def protocol_catalog() -> dict[str, dict[str, str]]:
+    return {name: dict(info) for name, info in PROTOCOL_CATALOG.items()}
 
 
 def resolve_model(body: dict[str, Any], provider: dict[str, Any], default_model: str) -> str:
@@ -326,17 +377,75 @@ async def check_provider(provider: dict[str, Any], default_model: str) -> dict[s
     return {"ok": False, "status": response.status_code, "detail": safe_response_detail(response)}
 
 
-async def fetch_provider_models(provider: dict[str, Any]) -> list[dict[str, Any]]:
-    # Only OpenAI-compatible protocols expose a Bearer-authenticated /models list
-    # in the expected {"data": [...]} shape. For claude/gemini the caller falls
-    # back to the configured provider["model"].
-    if provider_protocol(provider) not in {"openai", "domestic"}:
+def _model_list_request(provider: dict[str, Any], api_key: str) -> tuple[str, dict[str, str]]:
+    protocol = provider_protocol(provider)
+    base_url = provider["base_url"].rstrip("/")
+    if protocol == "claude":
+        return f"{base_url}/models", {
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "Accept": "application/json",
+        }
+    if protocol == "gemini":
+        return f"{base_url}/models", {
+            "x-goog-api-key": api_key,
+            "Accept": "application/json",
+        }
+    return f"{base_url}/models", {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+
+
+def _normalize_models_response(provider: dict[str, Any], data: Any) -> list[dict[str, Any]]:
+    protocol = provider_protocol(provider)
+    if not isinstance(data, dict):
         return []
-    url = f"{provider['base_url'].rstrip('/')}/models"
-    api_key = provider_api_keys(provider)[0]
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+
+    if protocol == "gemini":
+        models = data.get("models", [])
+        normalized = []
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            raw_id = str(model.get("name") or model.get("id") or "").strip()
+            if not raw_id:
+                continue
+            model_id = raw_id.removeprefix("models/")
+            normalized.append({
+                "id": model_id,
+                "object": "model",
+                "owned_by": provider.get("name", "gemini"),
+            })
+        return normalized
+
+    models = data.get("data", [])
+    normalized = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id") or model.get("name")
+        if not model_id:
+            continue
+        item = dict(model)
+        item["id"] = str(model_id).removeprefix("models/")
+        item.setdefault("object", "model")
+        normalized.append(item)
+    return normalized
+
+
+async def fetch_provider_models(provider: dict[str, Any]) -> list[dict[str, Any]]:
+    keys = provider_api_keys(provider)
+    if not keys:
+        return []
+
+    api_key = keys[0]
+    url, headers = _model_list_request(provider, api_key)
     if should_use_curl(provider):
-        cmd = [_curl_bin(), "-s", "-S", "--max-time", "15", "-H", f"Authorization: Bearer {api_key}", url]
+        curl_headers = []
+        for key, value in headers.items():
+            curl_headers += ["-H", f"{key}: {value}"]
+        cmd = [_curl_bin(), "-s", "-S", "--max-time", "15", *curl_headers, url]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, _ = await proc.communicate()
         data = json.loads(stdout.decode("utf-8", errors="replace"))
@@ -347,5 +456,4 @@ async def fetch_provider_models(provider: dict[str, Any]) -> list[dict[str, Any]
             return []
         data = response.json()
 
-    models = data.get("data", []) if isinstance(data, dict) else []
-    return [model for model in models if isinstance(model, dict) and model.get("id")]
+    return _normalize_models_response(provider, data)

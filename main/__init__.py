@@ -32,6 +32,7 @@ from ._providers import (
     curl_stream_request,
     fetch_provider_models,
     forward_to_provider,
+    protocol_catalog,
     provider_protocol,
     safe_response_detail,
     should_use_curl,
@@ -302,6 +303,8 @@ async def _try_provider(
     fwd: dict[str, Any] | None = None,
 ) -> tuple[str, Any]:
     protocol = (fwd or {}).get("protocol", "openai")
+    if protocol == "auto":
+        protocol = provider_protocol(provider)
     passthrough = bool(fwd)
     path_suffix = (fwd or {}).get("path_suffix", "/chat/completions")
 
@@ -370,6 +373,7 @@ async def _iterate_providers(
     for provider in config["providers"]:
         provider_name = provider["name"]
         key_attempts = key_attempt_order(provider, state)
+        key_count = len(provider_api_keys(provider))
         for key_index, api_key in key_attempts:
             started_at = time.perf_counter()
             try:
@@ -400,9 +404,9 @@ async def _iterate_providers(
 
             logger.info("provider=%s status=200 path=%s", provider_name, path)
             if kind == "response":
-                record_success(provider_name, data, len(key_attempts), key_index)
+                record_success(provider_name, data, key_count, key_index)
             else:
-                record_success(provider_name, httpx.Response(200, json={}), len(key_attempts), key_index)
+                record_success(provider_name, httpx.Response(200, json={}), key_count, key_index)
             return callback(data, provider_name, started_at, fallback_count, key_attempts, key_index, client, stream, path)
 
     raise HTTPException(status_code=502, detail=last_error)
@@ -517,19 +521,27 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def no_cache_dashboard_assets(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
 @app.get("/")
 def dashboard() -> FileResponse:
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="Dashboard files are missing")
-    return FileResponse(index_path)
+    return FileResponse(index_path, headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
     OpenAI-compatible chat completions endpoint.
-    Supports both OpenAI and domestic model providers.
+    Supports both OpenAI and domestic OpenAI-compatible model providers.
     """
     body = await read_v1_json_body(request)
     config = _filter_config_by_protocol(load_config(), {"openai", "domestic"})
@@ -538,7 +550,7 @@ async def chat_completions(request: Request):
             status_code=503,
             detail="No OpenAI or domestic model providers configured. Please add at least one provider with protocol 'openai' or 'domestic'."
         )
-    return await _passthrough(body, config, request, "domestic", "/chat/completions", "/v1/chat/completions")
+    return await _passthrough(body, config, request, "auto", "/chat/completions", "/v1/chat/completions")
 
 
 @app.post("/v1/responses")
@@ -636,7 +648,8 @@ def health_detailed() -> dict[str, Any]:
     Does not require authentication.
     """
     config = load_config()
-    protocols = {"openai": 0, "claude": 0, "gemini": 0, "domestic": 0}
+    catalog = protocol_catalog()
+    protocols = {protocol: 0 for protocol in catalog}
 
     for provider in config["providers"]:
         protocol = provider_protocol(provider)
@@ -646,6 +659,7 @@ def health_detailed() -> dict[str, Any]:
     return {
         "status": "ok",
         "protocols": protocols,
+        "protocol_catalog": catalog,
         "total_providers": len(config["providers"]),
         "endpoints": {
             "openai_chat": "/v1/chat/completions (OpenAI & domestic)",
@@ -653,6 +667,23 @@ def health_detailed() -> dict[str, Any]:
             "claude_messages": "/v1/messages (Claude only)",
             "gemini_generate": "/v1beta/models/{model}:generateContent (Gemini only)"
         }
+    }
+
+
+@app.get("/api/protocols")
+def protocols_endpoint(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_config()
+    counts = {protocol: 0 for protocol in protocol_catalog()}
+    for provider in config["providers"]:
+        protocol = provider_protocol(provider)
+        if protocol in counts:
+            counts[protocol] += 1
+    return {
+        "protocols": [
+            {"name": name, "count": counts.get(name, 0), **info}
+            for name, info in protocol_catalog().items()
+        ]
     }
 
 
@@ -691,6 +722,28 @@ async def save_config(request: Request) -> dict[str, Any]:
     return get_config(request)
 
 
+@app.delete("/api/providers/{provider_name}")
+def delete_provider(provider_name: str, request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_raw_config()
+    providers = config.get("providers", [])
+    remaining_providers = [
+        provider for provider in providers if provider.get("name") != provider_name
+    ]
+    if len(remaining_providers) == len(providers):
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
+
+    config["providers"] = remaining_providers
+    write_config_file(config)
+
+    state = load_state()
+    if provider_name in state:
+        state.pop(provider_name, None)
+        save_state(state)
+
+    return get_config(request)
+
+
 @app.get("/api/config/export")
 def export_config(request: Request) -> dict[str, Any]:
     require_proxy_access(request)
@@ -721,6 +774,7 @@ def provider_status(request: Request) -> dict[str, Any]:
         providers.append(
             {
                 "name": provider["name"],
+                "protocol": provider_protocol(provider),
                 "base_url": provider["base_url"],
                 "model": provider.get("model", config["default_model"]),
                 "priority": provider.get("priority", 1000),
@@ -790,10 +844,20 @@ async def providers_check_all(request: Request) -> dict[str, Any]:
 async def provider_models_endpoint(provider_name: str, request: Request) -> dict[str, Any]:
     require_proxy_access(request)
     config = load_config()
+    raw_config = load_raw_config()
+    raw_names = {provider.get("name") for provider in raw_config.get("providers", []) if provider.get("name")}
     for provider in config["providers"]:
         if provider["name"] == provider_name:
             models = await fetch_provider_models(provider)
             return {"provider": provider_name, "status": 200, "models": {"object": "list", "data": models}}
+    if provider_name in raw_names:
+        return {
+            "provider": provider_name,
+            "ok": False,
+            "status": "no_api_key",
+            "detail": "该 API 尚未启用或尚未填写密钥，请先在 UI 中启用并输入 API Key 后保存",
+            "models": {"object": "list", "data": []},
+        }
     raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
 
 
