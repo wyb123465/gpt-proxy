@@ -19,6 +19,9 @@
 - **多 Key 轮询**：成功调用后自动切换到下一个 Key，`429` 后进入冷却
 - **模型获取**：可在 UI 中获取单个 provider 模型，也可批量同步
 - **请求日志**：显示 provider、状态码、耗时、回退次数、流式状态和错误摘要
+- **请求统计**：聚合展示总尝试、成功/失败、平均耗时、常用模型和常用 provider
+- **客户端 Key**：可给不同本地客户端单独发 Key，并限制允许/排除的模型
+- **供应商模板**：内置 OpenAI、DeepSeek、Qwen、GLM、Moonshot、OpenRouter、Claude、Gemini 等常用模板
 - **安全选项**：本地访问 Token、请求限流、请求体大小限制、配置密钥加密
 - **Web 管理台**：添加、编辑、删除、导入、导出、测试 API 配置
 
@@ -96,6 +99,16 @@ for chunk in response:
 
 配置保存后，API Key 不会在页面回显；留空保存会保留旧密钥，输入新 Key 会替换旧密钥。
 
+## 本地客户端 Key
+
+在「安全设置」里可以新增本地客户端 Key。配置后：
+
+- `/v1/*` 调用需要携带 `Authorization: Bearer <client-key>` 或 `x-api-key: <client-key>`
+- 每个 Key 可设置 `allowed_models` 和 `excluded_models`
+- 模型规则支持通配符，例如 `gpt-*`、`gpt-image-*`
+- 如果没有配置客户端 Key，仍保持原来的本地开放模式
+- 如果设置了 `GPT_PROXY_ACCESS_TOKEN`，该环境变量 Key 仍可访问 `/v1/*` 和 `/api/*`
+
 ## 常用供应商示例
 
 ```json
@@ -113,6 +126,16 @@ for chunk in response:
         "gpt-4o": "deepseek-chat",
         "gpt-3.5-turbo": "deepseek-chat"
       }
+    }
+  ],
+  "client_keys": [
+    {
+      "id": "chatbox",
+      "label": "ChatBox",
+      "key": "local-client-key",
+      "enabled": true,
+      "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+      "excluded_models": ["gpt-image-*"]
     }
   ],
   "default_model": "gpt-4o"

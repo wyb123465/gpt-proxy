@@ -160,6 +160,25 @@ def test_protocol_catalog_endpoint_returns_four_groups(tmp_path, monkeypatch):
     assert protocols["claude"]["native_endpoint"] == "/v1/messages"
 
 
+def test_provider_presets_endpoint_returns_common_templates(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    client = TestClient(main.app)
+    response = client.get("/api/provider-presets")
+
+    assert response.status_code == 200
+    presets = {preset["id"]: preset for preset in response.json()["presets"]}
+    assert "openrouter" in presets
+    assert "moonshot" in presets
+    assert presets["openrouter"]["protocol"] == "domestic"
+    assert presets["moonshot"]["base_url"] == "https://api.moonshot.cn/v1"
+
+
 def test_dashboard_config_masks_and_preserves_existing_key(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"
@@ -198,6 +217,73 @@ def test_dashboard_config_masks_and_preserves_existing_key(tmp_path, monkeypatch
     assert saved["default_model"] == "new-default"
     assert saved["providers"][0]["api_key"] == "secret-key"
     assert saved["providers"][0]["model"] == "new-model"
+
+
+def test_dashboard_config_masks_and_preserves_client_keys(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_model": "default-model",
+                "providers": [make_provider("official", 0, api_key="secret-key")],
+                "client_keys": [
+                    {
+                        "id": "key-1",
+                        "label": "ChatBox",
+                        "key": "local-secret",
+                        "enabled": True,
+                        "allowed_models": ["gpt-4o"],
+                        "excluded_models": ["gpt-image-*"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    client = TestClient(main.app)
+    response = client.get("/api/config")
+
+    assert response.status_code == 200
+    client_key = response.json()["client_keys"][0]
+    assert client_key["key"] == ""
+    assert client_key["has_key"] is True
+    assert "local-secret" not in response.text
+
+    saved_response = client.post(
+        "/api/config",
+        json={
+            "default_model": "default-model",
+            "providers": [
+                {
+                    "name": "official",
+                    "base_url": "https://official.example/v1",
+                    "priority": 0,
+                    "api_key": "",
+                }
+            ],
+            "client_keys": [
+                {
+                    "id": "key-1",
+                    "label": "ChatBox renamed",
+                    "key": "",
+                    "enabled": True,
+                    "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+                    "excluded_models": ["gpt-image-*"],
+                }
+            ],
+        },
+    )
+
+    assert saved_response.status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["client_keys"][0]["key"] == "local-secret"
+    assert saved["client_keys"][0]["label"] == "ChatBox renamed"
+    assert saved["client_keys"][0]["allowed_models"] == ["gpt-4o", "gpt-4o-mini"]
 
 
 def test_dashboard_can_delete_provider_and_state(tmp_path, monkeypatch):
@@ -622,6 +708,41 @@ def test_request_log_records_recent_attempts(tmp_path, monkeypatch):
     assert entry["latency_ms"] >= 0
 
 
+def test_stats_endpoint_aggregates_recent_attempts(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(config_path, [make_provider("official", 0)])
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    assert client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": []},
+    ).status_code == 200
+
+    response = client.get("/api/stats")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"]["attempts"] == 1
+    assert data["total"]["success"] == 1
+    assert data["providers"][0]["name"] == "official"
+    assert data["providers"][0]["attempts"] == 1
+    assert data["models"][0]["name"] == "gpt-4o"
+    assert data["models"][0]["success"] == 1
+
+
 def test_streaming_chat_completion_proxies_event_stream(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"
@@ -687,6 +808,60 @@ def test_proxy_access_token_protects_v1_endpoints(tmp_path, monkeypatch):
     )
 
     assert allowed.status_code == 200
+
+
+def test_configured_client_key_protects_v1_and_enforces_model_policy(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_model": "gpt-4o",
+                "providers": [make_provider("official", 0)],
+                "client_keys": [
+                    {
+                        "id": "chatbox",
+                        "label": "ChatBox",
+                        "key": "client-secret",
+                        "enabled": True,
+                        "allowed_models": ["gpt-4o"],
+                        "excluded_models": ["gpt-image-*"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "PROXY_ACCESS_TOKEN", "", raising=False)
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    denied = client.post("/v1/chat/completions", json={"model": "gpt-4o", "messages": []})
+    allowed = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer client-secret"},
+        json={"model": "gpt-4o", "messages": []},
+    )
+    blocked_model = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer client-secret"},
+        json={"model": "gpt-image-2", "messages": []},
+    )
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+    assert blocked_model.status_code == 403
 
 
 def test_v1_rate_limit_returns_429(tmp_path, monkeypatch):

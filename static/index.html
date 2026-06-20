@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>GPT Proxy Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260620-ui7" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260620-ui8" />
   </head>
   <body>
     <main class="shell">
@@ -172,6 +172,19 @@
           <button id="saveProxyTokenBtn" class="secondary-btn" type="button">保存密钥</button>
           <button id="clearProxyTokenBtn" class="ghost-btn" type="button">清除</button>
         </div>
+        <section class="client-key-manager" aria-label="本地客户端 Key">
+          <div class="client-key-head">
+            <div>
+              <h3>本地客户端 Key</h3>
+              <p>给 ChatBox、Codex++ 等客户端单独发 Key，可限制可用模型；配置后 `/v1/*` 会要求带 Key。</p>
+            </div>
+            <button id="addClientKeyBtn" class="secondary-btn" type="button">新增客户端 Key</button>
+          </div>
+          <div id="clientKeyList" class="client-key-list">
+            <p class="mini-empty">暂无客户端 Key</p>
+          </div>
+          <button id="saveClientKeysBtn" class="primary-btn" type="button">保存客户端 Key</button>
+        </section>
       </section>
 
       <section class="panel diagnostics-panel view-panel" data-view-panel="diagnostics" aria-label="配置体检">
@@ -295,31 +308,8 @@ for chunk in response:
               <p>一键填入常见服务商的协议、Base URL 和默认模型；密钥仍只在本地填写保存。</p>
             </div>
           </div>
-          <div class="preset-grid">
-            <button class="preset-card" type="button" data-add-preset="openai">
-              <strong>OpenAI</strong>
-              <span>官方 OpenAI API</span>
-            </button>
-            <button class="preset-card" type="button" data-add-preset="deepseek">
-              <strong>DeepSeek</strong>
-              <span>国内兼容入口</span>
-            </button>
-            <button class="preset-card" type="button" data-add-preset="qwen">
-              <strong>通义千问</strong>
-              <span>DashScope 兼容模式</span>
-            </button>
-            <button class="preset-card" type="button" data-add-preset="glm">
-              <strong>智谱 GLM</strong>
-              <span>BigModel OpenAI 兼容</span>
-            </button>
-            <button class="preset-card" type="button" data-add-preset="claude">
-              <strong>Claude</strong>
-              <span>Anthropic 原生协议</span>
-            </button>
-            <button class="preset-card" type="button" data-add-preset="gemini">
-              <strong>Gemini</strong>
-              <span>Google 原生协议</span>
-            </button>
+          <div id="providerPresetGrid" class="preset-grid">
+            <p class="mini-empty">正在读取常用模板</p>
           </div>
         </section>
 
@@ -368,6 +358,7 @@ for chunk in response:
           </div>
           <button id="refreshRequestsBtn" class="secondary-btn" type="button">刷新日志</button>
         </div>
+        <div id="requestStatsGrid" class="request-stats-grid" aria-label="请求统计"></div>
         <div class="request-filters" aria-label="请求日志筛选">
           <label>
             <span>状态</span>
@@ -389,6 +380,8 @@ for chunk in response:
               <tr>
                 <th>时间</th>
                 <th>API</th>
+                <th>模型</th>
+                <th>客户端 Key</th>
                 <th>状态</th>
                 <th>耗时</th>
                 <th>回退</th>
@@ -398,7 +391,7 @@ for chunk in response:
               </tr>
             </thead>
             <tbody id="requestLogBody">
-              <tr><td colspan="8" class="empty-cell">暂无请求记录</td></tr>
+              <tr><td colspan="10" class="empty-cell">暂无请求记录</td></tr>
             </tbody>
           </table>
         </div>
@@ -482,6 +475,6 @@ for chunk in response:
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260620-ui7" defer></script>
+    <script src="/static/app.js?v=20260620-ui8" defer></script>
   </body>
 </html>

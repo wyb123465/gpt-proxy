@@ -716,7 +716,7 @@ button:disabled {
 
 .preset-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 1px;
   background: var(--line);
 }
@@ -745,6 +745,91 @@ button:disabled {
 
 .preset-card:hover {
   background: var(--accent-soft);
+}
+
+.client-key-manager {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow-subtle);
+}
+
+.client-key-head,
+.client-key-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.client-key-head h3 {
+  font-size: 15px;
+}
+
+.client-key-head p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.client-key-list {
+  display: grid;
+  gap: 10px;
+}
+
+.client-key-card {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.client-key-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.client-key-grid textarea {
+  min-height: 72px;
+}
+
+.request-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.request-stat-card {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  box-shadow: var(--shadow-subtle);
+}
+
+.request-stat-card span,
+.request-stat-card small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.request-stat-card strong {
+  overflow: hidden;
+  font-size: 20px;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .channel-overview {
@@ -1213,7 +1298,11 @@ button:disabled {
   .nav-item { min-height: 52px; }
   .nav-item:hover { transform: none; }
   .provider-actions { width: 100%; }
-  .summary, .quickstart, .overview-grid, .overview-callout, .protocol-builder, .preset-grid { grid-template-columns: 1fr; }
+  .summary, .quickstart, .overview-grid, .overview-callout, .protocol-builder, .preset-grid, .client-key-grid, .request-stats-grid { grid-template-columns: 1fr; }
+  .client-key-head, .client-key-card-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
   .callout-endpoint {
     align-items: stretch;
     flex-direction: column;
@@ -1276,7 +1365,7 @@ button:disabled {
 .request-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 760px;
+  min-width: 980px;
   background: var(--surface-soft);
 }
 

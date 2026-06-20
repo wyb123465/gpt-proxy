@@ -65,6 +65,13 @@ def decrypt_config(config: dict[str, Any]) -> dict[str, Any]:
             item["api_keys"] = [decrypt_secret_value(str(key)) for key in item["api_keys"]]
         providers.append(item)
     decrypted["providers"] = providers
+    client_keys = []
+    for client_key in config.get("client_keys", []):
+        item = dict(client_key)
+        if item.get("key"):
+            item["key"] = decrypt_secret_value(str(item["key"]))
+        client_keys.append(item)
+    decrypted["client_keys"] = client_keys
     return decrypted
 
 
@@ -81,6 +88,13 @@ def encrypt_config(config: dict[str, Any]) -> dict[str, Any]:
             item["api_keys"] = [encrypt_secret_value(str(key)) for key in item["api_keys"]]
         providers.append(item)
     encrypted["providers"] = providers
+    client_keys = []
+    for client_key in config.get("client_keys", []):
+        item = dict(client_key)
+        if item.get("key"):
+            item["key"] = encrypt_secret_value(str(item["key"]))
+        client_keys.append(item)
+    encrypted["client_keys"] = client_keys
     return encrypted
 
 
@@ -166,6 +180,38 @@ def normalize_provider(provider: dict[str, Any], existing_provider: dict[str, An
     return normalized
 
 
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.replace(",", "\n").splitlines() if item.strip()]
+    return []
+
+
+def normalize_client_key(
+    client_key: dict[str, Any],
+    existing_client_key: dict[str, Any] | None = None,
+    fallback_id: str = "client-key",
+) -> dict[str, Any]:
+    key_id = str(client_key.get("id", "")).strip() or fallback_id
+    label = str(client_key.get("label", "")).strip() or key_id
+    key = str(client_key.get("key", "")).strip()
+    enabled = bool(client_key.get("enabled", True))
+
+    normalized: dict[str, Any] = {
+        "id": key_id,
+        "label": label,
+        "enabled": enabled,
+        "allowed_models": _string_list(client_key.get("allowed_models")),
+        "excluded_models": _string_list(client_key.get("excluded_models")),
+    }
+    if key:
+        normalized["key"] = key
+    elif existing_client_key and existing_client_key.get("key"):
+        normalized["key"] = existing_client_key["key"]
+    return normalized
+
+
 def normalize_config_payload(payload: dict[str, Any], existing_config: dict[str, Any] | None = None) -> dict[str, Any]:
     existing_config = existing_config or {"providers": []}
     existing_by_name = {
@@ -187,9 +233,32 @@ def normalize_config_payload(payload: dict[str, Any], existing_config: dict[str,
         seen_names.add(normalized["name"])
         providers.append(normalized)
 
+    existing_client_keys = {
+        client_key.get("id"): client_key
+        for client_key in existing_config.get("client_keys", [])
+        if client_key.get("id")
+    }
+    raw_client_keys = payload.get("client_keys", existing_config.get("client_keys", []))
+    if not isinstance(raw_client_keys, list):
+        raise ValueError("client_keys must be a list")
+
+    client_keys = []
+    seen_client_key_ids = set()
+    for index, client_key in enumerate(raw_client_keys):
+        normalized = normalize_client_key(
+            client_key,
+            existing_client_keys.get(client_key.get("id")),
+            fallback_id=f"client-key-{index + 1}",
+        )
+        if normalized["id"] in seen_client_key_ids:
+            raise ValueError(f"Client key '{normalized['id']}' is duplicated")
+        seen_client_key_ids.add(normalized["id"])
+        client_keys.append(normalized)
+
     return {
         "providers": sorted(providers, key=lambda item: item.get("priority", 1000)),
         "default_model": default_model,
+        "client_keys": client_keys,
     }
 
 
@@ -215,3 +284,15 @@ def editable_provider(provider: dict[str, Any], state: dict[str, Any], default_m
         "last_remaining": provider_state.get("last_remaining"),
     }
 
+
+def editable_client_key(client_key: dict[str, Any]) -> dict[str, Any]:
+    key = str(client_key.get("key", "")).strip()
+    return {
+        "id": client_key.get("id", ""),
+        "label": client_key.get("label", ""),
+        "key": "",
+        "has_key": bool(key),
+        "enabled": bool(client_key.get("enabled", True)),
+        "allowed_models": client_key.get("allowed_models") or [],
+        "excluded_models": client_key.get("excluded_models") or [],
+    }

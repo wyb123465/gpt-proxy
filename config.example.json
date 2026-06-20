@@ -80,5 +80,20 @@
       "use_curl": false
     }
   ],
+  "client_keys": [
+    {
+      "id": "chatbox",
+      "label": "ChatBox",
+      "key": "local-client-key",
+      "enabled": true,
+      "allowed_models": [
+        "gpt-4o",
+        "gpt-4o-mini"
+      ],
+      "excluded_models": [
+        "gpt-image-*"
+      ]
+    }
+  ],
   "default_model": "gpt-4o"
 }

@@ -8,9 +8,11 @@ const usableCount = document.querySelector("#usableCount");
 const totalCalls = document.querySelector("#totalCalls");
 const modelSummary = document.querySelector("#modelSummary");
 const requestLogBody = document.querySelector("#requestLogBody");
+const requestStatsGrid = document.querySelector("#requestStatsGrid");
 const overviewProviderList = document.querySelector("#overviewProviderList");
 const overviewProtocolList = document.querySelector("#overviewProtocolList");
 const overviewRequestList = document.querySelector("#overviewRequestList");
+const providerPresetGrid = document.querySelector("#providerPresetGrid");
 const checkReport = document.querySelector("#checkReport");
 const diagnosticSummary = document.querySelector("#diagnosticSummary");
 const diagnosticCheckReport = document.querySelector("#diagnosticCheckReport");
@@ -22,6 +24,9 @@ const bodyLimitState = document.querySelector("#bodyLimitState");
 const cooldownState = document.querySelector("#cooldownState");
 const importConfigFile = document.querySelector("#importConfigFile");
 const localProxyTokenInput = document.querySelector("#localProxyToken");
+const clientKeyList = document.querySelector("#clientKeyList");
+const addClientKeyBtn = document.querySelector("#addClientKeyBtn");
+const saveClientKeysBtn = document.querySelector("#saveClientKeysBtn");
 const saveAndTestBtn = document.querySelector("#saveAndTestBtn");
 const viewKicker = document.querySelector("#viewKicker");
 const viewTitle = document.querySelector("#viewTitle");
@@ -35,7 +40,9 @@ const runDiagnosticsBtn = document.querySelector("#runDiagnosticsBtn");
 const syncModelsBtn = document.querySelector("#syncModelsBtn");
 
 let providers = [];
+let clientKeys = [];
 let latestRequests = [];
+let latestStats = null;
 let latestSecurity = {};
 let protocolCatalog = {};
 let activeProviderName = "";
@@ -79,7 +86,7 @@ const protocolDefaults = {
   },
 };
 
-const providerPresets = {
+let providerPresets = {
   openai: {
     name: "openai-official",
     protocol: "openai",
@@ -142,8 +149,62 @@ const providerPresets = {
   },
 };
 
+let providerPresetList = Object.entries(providerPresets).map(([id, preset]) => ({
+  id,
+  display_name: preset.name,
+  ...preset,
+}));
+
 function protocolInfo(protocol) {
   return protocolCatalog[protocol] || protocolDefaults[protocol] || protocolDefaults.openai;
+}
+
+function normalizeProviderPreset(rawPreset) {
+  const id = String(rawPreset.id || rawPreset.name || "custom").trim();
+  const displayName = rawPreset.display_name || rawPreset.name || id;
+  return {
+    id,
+    display_name: displayName,
+    name: rawPreset.provider_name || id,
+    protocol: rawPreset.protocol || "openai",
+    base_url: rawPreset.base_url || rawPreset.default_base_url || "",
+    model: rawPreset.model || rawPreset.default_model || "",
+    priority: Number(rawPreset.priority ?? 0),
+    description: rawPreset.description || "",
+    website: rawPreset.website || "",
+    api_key_url: rawPreset.api_key_url || rawPreset.apiKeyUrl || "",
+    model_aliases: rawPreset.model_aliases || rawPreset.modelAliases || {},
+  };
+}
+
+function setProviderPresets(items) {
+  const normalized = (items || []).map(normalizeProviderPreset).filter((preset) => preset.id);
+  if (normalized.length) {
+    providerPresetList = normalized;
+    providerPresets = Object.fromEntries(normalized.map((preset) => [preset.id, preset]));
+  }
+  renderProviderPresets();
+}
+
+function renderProviderPresets() {
+  if (!providerPresetGrid) return;
+  providerPresetGrid.innerHTML = "";
+  providerPresetList.forEach((preset) => {
+    const button = document.createElement("button");
+    button.className = "preset-card";
+    button.type = "button";
+    button.dataset.addPreset = preset.id;
+
+    const name = document.createElement("strong");
+    name.textContent = preset.display_name || preset.name || preset.id;
+
+    const meta = document.createElement("span");
+    const protocol = protocolLabels[preset.protocol] || preset.protocol || "OpenAI";
+    meta.textContent = `${protocol} · ${preset.description || preset.base_url}`;
+
+    button.append(name, meta);
+    providerPresetGrid.appendChild(button);
+  });
 }
 
 const viewCopy = {
@@ -211,6 +272,109 @@ function markSavedProviders(items) {
     ...provider,
     _savedName: provider.name || "",
   }));
+}
+
+function markSavedClientKeys(items) {
+  return (items || []).map((clientKey) => ({
+    ...clientKey,
+    _savedId: clientKey.id || "",
+    allowed_models_text: (clientKey.allowed_models || []).join("\n"),
+    excluded_models_text: (clientKey.excluded_models || []).join("\n"),
+  }));
+}
+
+function modelRuleList(value) {
+  return String(value || "")
+    .replace(/,/g, "\n")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function nextClientKeyId() {
+  const usedIds = new Set(clientKeys.map((clientKey) => String(clientKey.id || "").trim()));
+  let index = clientKeys.length + 1;
+  while (usedIds.has(`client-${index}`)) index += 1;
+  return `client-${index}`;
+}
+
+function clientKeyPlaceholder(clientKey) {
+  if (clientKey.has_key && !clientKey.key) {
+    return "已保存；留空保存 = 保留旧 Key，输入新值 = 替换";
+  }
+  return "local-client-key";
+}
+
+function renderClientKeys() {
+  if (!clientKeyList) return;
+  clientKeyList.innerHTML = "";
+  if (!clientKeys.length) {
+    clientKeyList.innerHTML = '<p class="mini-empty">暂无客户端 Key；不配置时 `/v1/*` 仍按环境变量访问密钥工作。</p>';
+    return;
+  }
+
+  clientKeys.forEach((clientKey, index) => {
+    const card = document.createElement("article");
+    card.className = "client-key-card";
+
+    const head = document.createElement("div");
+    head.className = "client-key-card-head";
+    const title = document.createElement("strong");
+    title.textContent = clientKey.label || clientKey.id || "客户端 Key";
+    const remove = document.createElement("button");
+    remove.className = "ghost-btn";
+    remove.type = "button";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      clientKeys.splice(index, 1);
+      renderClientKeys();
+      setMessage("已移除客户端 Key，记得保存配置", "ok");
+    });
+    head.append(title, remove);
+
+    const grid = document.createElement("div");
+    grid.className = "client-key-grid";
+    const fields = [
+      ["label", "名称", "ChatBox"],
+      ["id", "ID", "client-1"],
+      ["key", "Key", clientKeyPlaceholder(clientKey)],
+      ["allowed_models_text", "允许模型", "留空 = 不限制\ngpt-4o\nqwen-*"],
+      ["excluded_models_text", "排除模型", "gpt-image-*"],
+    ];
+
+    fields.forEach(([field, label, placeholder]) => {
+      const wrapper = document.createElement("label");
+      wrapper.className = "field";
+      const text = document.createElement("span");
+      text.textContent = label;
+      const input = field.endsWith("_text") ? document.createElement("textarea") : document.createElement("input");
+      input.autocomplete = "off";
+      input.placeholder = placeholder;
+      input.value = clientKey[field] || "";
+      input.addEventListener("input", () => {
+        clientKeys[index][field] = input.value;
+        if (field === "label") title.textContent = input.value || clientKeys[index].id || "客户端 Key";
+      });
+      wrapper.append(text, input);
+      grid.appendChild(wrapper);
+    });
+
+    const enabledLabel = document.createElement("label");
+    enabledLabel.className = "field checkbox-field";
+    const enabledText = document.createElement("span");
+    enabledText.textContent = "启用该 Key";
+    const enabledInput = document.createElement("input");
+    enabledInput.type = "checkbox";
+    enabledInput.checked = clientKey.enabled !== false;
+    enabledInput.addEventListener("change", () => {
+      clientKeys[index].enabled = enabledInput.checked;
+    });
+    enabledLabel.append(enabledText, enabledInput);
+    grid.appendChild(enabledLabel);
+
+    card.append(head, grid);
+    clientKeyList.appendChild(card);
+  });
 }
 
 function savedKeyCount(provider) {
@@ -602,10 +766,12 @@ async function fetchJson(url, options = {}) {
 
 async function loadConfig() {
   setMessage("正在读取配置...");
-  const [health, detailedHealth, protocolData, config] = await Promise.all([
+  const [health, detailedHealth, protocolData, presetData, statsData, config] = await Promise.all([
     fetchJson("/health").catch(() => null),
     fetchJson("/health/detailed").catch(() => null),
     fetchJson("/api/protocols").catch(() => null),
+    fetchJson("/api/provider-presets").catch(() => null),
+    fetchJson("/api/stats").catch(() => null),
     fetchJson("/api/config"),
   ]);
 
@@ -621,7 +787,11 @@ async function loadConfig() {
   healthBadge.className = health ? "badge" : "badge muted";
   defaultModelInput.value = config.default_model || "gpt-4o";
   providers = markSavedProviders(config.providers);
+  clientKeys = markSavedClientKeys(config.client_keys || []);
+  setProviderPresets(presetData?.presets || providerPresetList);
   renderSecurity(config.security);
+  renderClientKeys();
+  renderRequestStats(statsData);
   renderProviders();
   renderOverviewProtocols(detailedHealth?.protocols);
   await loadRequests();
@@ -657,6 +827,14 @@ function collectPayload() {
           )
         : {},
     })),
+    client_keys: clientKeys.map((clientKey) => ({
+      id: String(clientKey.id || clientKey._savedId || "").trim(),
+      label: String(clientKey.label || "").trim(),
+      key: String(clientKey.key || "").trim(),
+      enabled: clientKey.enabled !== false,
+      allowed_models: modelRuleList(clientKey.allowed_models_text),
+      excluded_models: modelRuleList(clientKey.excluded_models_text),
+    })),
   };
 }
 
@@ -672,12 +850,14 @@ async function saveConfig() {
     });
     defaultModelInput.value = config.default_model;
     providers = markSavedProviders(config.providers);
+    clientKeys = markSavedClientKeys(config.client_keys || []);
     if (selectedName && providers.some((provider) => providerSelectionName(provider) === selectedName || provider.name === selectedName)) {
       activeProviderName = selectedName;
     } else if (activeProviderName && !providers.some((provider) => providerSelectionName(provider) === activeProviderName)) {
       activeProviderName = "";
     }
     renderSecurity(config.security);
+    renderClientKeys();
     renderProviders();
     setMessage("已保存，下一次请求会使用新配置", "ok");
     return config;
@@ -737,8 +917,10 @@ async function deleteProvider(index, node) {
     });
     defaultModelInput.value = config.default_model;
     providers = markSavedProviders(config.providers);
+    clientKeys = markSavedClientKeys(config.client_keys || []);
     activeProviderName = "";
     renderSecurity(config.security);
+    renderClientKeys();
     renderProviders();
     setMessage(`已删除「${savedName}」并保存配置`, "ok");
   } catch (error) {
@@ -1105,11 +1287,39 @@ function formatTime(value) {
   return new Date(value).toLocaleTimeString("zh-CN", { hour12: false });
 }
 
+function renderRequestStats(stats) {
+  latestStats = stats || latestStats;
+  if (!requestStatsGrid) return;
+  const total = latestStats?.total || {};
+  const topProvider = latestStats?.providers?.[0];
+  const topModel = latestStats?.models?.[0];
+  const items = [
+    ["后端尝试", total.attempts ?? 0, `成功 ${total.success ?? 0} · 失败 ${total.failed ?? 0}`],
+    ["平均耗时", `${total.avg_latency_ms ?? 0} ms`, `回退 ${total.fallbacks ?? 0} 次`],
+    ["最常用 API", topProvider?.name || "-", `${topProvider?.attempts ?? 0} 次尝试`],
+    ["最常用模型", topModel?.name || "-", `${topModel?.success ?? 0} 次成功`],
+  ];
+
+  requestStatsGrid.innerHTML = "";
+  items.forEach(([label, value, hint]) => {
+    const card = document.createElement("div");
+    card.className = "request-stat-card";
+    const labelNode = document.createElement("span");
+    labelNode.textContent = label;
+    const valueNode = document.createElement("strong");
+    valueNode.textContent = String(value);
+    const hintNode = document.createElement("small");
+    hintNode.textContent = hint;
+    card.append(labelNode, valueNode, hintNode);
+    requestStatsGrid.appendChild(card);
+  });
+}
+
 function renderEmptyRequestRow(text) {
   requestLogBody.innerHTML = "";
   const row = document.createElement("tr");
   const cell = document.createElement("td");
-  cell.colSpan = 8;
+  cell.colSpan = 10;
   cell.className = "empty-cell";
   cell.textContent = text;
   row.appendChild(cell);
@@ -1163,6 +1373,8 @@ function filteredRequests() {
 
     const searchable = [
       entry.provider,
+      entry.model,
+      entry.client_key,
       entry.status,
       entry.path,
       entry.stream_status,
@@ -1197,6 +1409,8 @@ function renderRequests(requests) {
     const statusClass = Number(entry.status) === 200 ? "ok-text" : "error-text";
     appendRequestCell(row, formatTime(entry.time));
     appendRequestCell(row, entry.provider || "-");
+    appendRequestCell(row, entry.model || "-");
+    appendRequestCell(row, entry.client_key || "-");
     appendRequestCell(row, String(entry.status ?? "-"), statusClass);
     appendRequestCell(row, `${entry.latency_ms ?? "-"} ms`);
     appendRequestCell(row, String(entry.fallback_count ?? 0));
@@ -1209,7 +1423,11 @@ function renderRequests(requests) {
 
 async function loadRequests() {
   try {
-    const data = await fetchJson("/api/requests");
+    const [data, stats] = await Promise.all([
+      fetchJson("/api/requests"),
+      fetchJson("/api/stats").catch(() => null),
+    ]);
+    renderRequestStats(stats);
     renderRequests(data.requests || []);
   } catch (error) {
     renderEmptyRequestRow(`读取失败：${error.message}`);
@@ -1251,9 +1469,13 @@ function nextProviderName(baseName) {
 function addProviderPreset(presetName) {
   const preset = providerPresets[presetName];
   if (!preset) return addProvider();
+  const nextPriority = providers.length
+    ? Math.max(...providers.map((provider) => Number(provider.priority || 0))) + 1
+    : Number(preset.priority || 0);
   const provider = {
     ...preset,
     name: nextProviderName(preset.name),
+    priority: nextPriority,
     api_keys_text: "",
     api_key_env: "",
     has_api_key: false,
@@ -1315,6 +1537,24 @@ document.addEventListener("click", (event) => {
   addProviderPreset(button.dataset.addPreset);
 });
 document.querySelector("#saveBtn").addEventListener("click", () => {
+  saveConfig().catch(() => {});
+});
+addClientKeyBtn.addEventListener("click", () => {
+  const id = nextClientKeyId();
+  clientKeys.push({
+    id,
+    label: `客户端 ${clientKeys.length + 1}`,
+    key: "",
+    has_key: false,
+    enabled: true,
+    allowed_models_text: "",
+    excluded_models_text: "",
+  });
+  renderClientKeys();
+  setActiveView("security");
+  setMessage("已新增客户端 Key，填写 Key 后保存", "ok");
+});
+saveClientKeysBtn.addEventListener("click", () => {
   saveConfig().catch(() => {});
 });
 saveAndTestBtn.addEventListener("click", saveAndTestAll);

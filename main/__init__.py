@@ -1,4 +1,6 @@
 import asyncio
+import fnmatch
+import hmac
 import json
 import logging
 import os
@@ -16,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from ._config import (
     apply_env_overrides,
     decrypt_config,
+    editable_client_key,
     editable_provider,
     encrypt_config,
     normalize_config_payload,
@@ -33,11 +36,12 @@ from ._providers import (
     fetch_provider_models,
     forward_to_provider,
     protocol_catalog,
+    provider_presets,
     provider_protocol,
     safe_response_detail,
     should_use_curl,
 )
-from ._state import key_fingerprint, request_log_entry
+from ._state import key_fingerprint, record_request_stats, request_log_entry, summarize_request_stats
 
 # ---------------------------------------------------------------------------
 # Monkeypatchable module-level constants
@@ -182,6 +186,7 @@ def record_success(
 
 def append_request_log(entry: dict[str, Any]) -> None:
     state = load_state()
+    record_request_stats(state, entry)
     requests = state.setdefault("_requests", [])
     requests.insert(0, entry)
     del requests[REQUEST_LOG_LIMIT:]
@@ -200,6 +205,7 @@ def load_raw_config() -> dict[str, Any]:
     config = decrypt_config(read_json_file(CONFIG_PATH, {"providers": [], "default_model": "gpt-3.5-turbo"}))
     config.setdefault("providers", [])
     config.setdefault("default_model", "gpt-3.5-turbo")
+    config.setdefault("client_keys", [])
     return config
 
 
@@ -232,6 +238,60 @@ def require_proxy_access(request: Request) -> None:
     raise HTTPException(status_code=401, detail="Missing or invalid local proxy access token")
 
 
+def _request_token(request: Request) -> str:
+    auth_header = request.headers.get("authorization", "")
+    x_api_key = request.headers.get("x-api-key", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return x_api_key.strip()
+
+
+def _enabled_client_keys() -> list[dict[str, Any]]:
+    return [
+        client_key
+        for client_key in load_raw_config().get("client_keys", [])
+        if client_key.get("enabled", True) and str(client_key.get("key", "")).strip()
+    ]
+
+
+def _model_matches_any(model: str, patterns: list[str]) -> bool:
+    normalized = model.strip().lower()
+    return any(fnmatch.fnmatchcase(normalized, pattern.strip().lower()) for pattern in patterns if pattern.strip())
+
+
+def _authorize_model_for_client_key(client_key: dict[str, Any], model: str | None) -> None:
+    if not model:
+        return
+    allowed_models = [str(item) for item in client_key.get("allowed_models", [])]
+    excluded_models = [str(item) for item in client_key.get("excluded_models", [])]
+    if allowed_models and not _model_matches_any(model, allowed_models):
+        raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this local client key")
+    if excluded_models and _model_matches_any(model, excluded_models):
+        raise HTTPException(status_code=403, detail=f"Model '{model}' is excluded for this local client key")
+
+
+def authorize_v1_request(request: Request, body: dict[str, Any]) -> None:
+    token = _request_token(request)
+    if PROXY_ACCESS_TOKEN and hmac.compare_digest(token, PROXY_ACCESS_TOKEN):
+        request.state.client_key_label = "proxy-token"
+        return
+
+    client_keys = _enabled_client_keys()
+    if not client_keys:
+        if PROXY_ACCESS_TOKEN:
+            raise HTTPException(status_code=401, detail="Missing or invalid local proxy access token")
+        request.state.client_key_label = ""
+        return
+
+    for client_key in client_keys:
+        if hmac.compare_digest(token, str(client_key.get("key", ""))):
+            request.state.client_key_label = client_key.get("label") or client_key.get("id") or "client-key"
+            model = str(body.get("model", "")).strip() if isinstance(body, dict) else ""
+            _authorize_model_for_client_key(client_key, model or None)
+            return
+    raise HTTPException(status_code=401, detail="Missing or invalid local client API key")
+
+
 def enforce_rate_limit(request: Request) -> None:
     if RATE_LIMIT_PER_MINUTE <= 0:
         return
@@ -254,15 +314,16 @@ def enforce_rate_limit(request: Request) -> None:
 
 
 async def read_v1_json_body(request: Request) -> dict[str, Any]:
-    require_proxy_access(request)
-    enforce_rate_limit(request)
     raw = await request.body()
     if MAX_REQUEST_BYTES > 0 and len(raw) > MAX_REQUEST_BYTES:
         raise HTTPException(status_code=413, detail="Request body is too large")
     try:
-        return json.loads(raw.decode("utf-8")) if raw else {}
+        body = json.loads(raw.decode("utf-8")) if raw else {}
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
+    authorize_v1_request(request, body)
+    enforce_rate_limit(request)
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +418,15 @@ async def _try_provider(
     return ("fatal_response", JSONResponse(content=safe_response_detail(response), status_code=response.status_code))
 
 
+def _request_model_for_log(body: dict[str, Any], path: str, default_model: str) -> str:
+    if isinstance(body, dict) and str(body.get("model", "")).strip():
+        return str(body["model"]).strip()
+    marker = "/v1beta/models/"
+    if path.startswith(marker) and ":" in path:
+        return path[len(marker):].split(":", 1)[0]
+    return default_model
+
+
 async def _iterate_providers(
     body: dict[str, Any],
     config: dict[str, Any],
@@ -365,10 +435,13 @@ async def _iterate_providers(
     stream: bool,
     path: str = "/v1/chat/completions",
     fwd: dict[str, Any] | None = None,
+    log_model: str | None = None,
+    client_key_label: str | None = None,
 ) -> Any:
     last_error = "所有后端 API 均不可用"
     fallback_count = 0
     state = load_state()
+    log_model = log_model or _request_model_for_log(body, path, config.get("default_model", "gpt-3.5-turbo"))
 
     for provider in config["providers"]:
         provider_name = provider["name"]
@@ -381,18 +454,18 @@ async def _iterate_providers(
             except httpx.RequestError as exc:
                 logger.info("provider=%s status=request_error path=%s", provider_name, path)
                 last_error = str(exc)
-                append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error, streamed=stream, path=path))
+                append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error, streamed=stream, path=path, model=log_model, client_key=client_key_label))
                 fallback_count += 1
                 continue
             except HTTPException as exc:
                 logger.info("provider=%s status=%s path=%s", provider_name, exc.status_code, path)
-                append_request_log(request_log_entry(provider_name, exc.status_code, started_at, fallback_count, streamed=stream, path=path))
+                append_request_log(request_log_entry(provider_name, exc.status_code, started_at, fallback_count, streamed=stream, path=path, model=log_model, client_key=client_key_label))
                 raise
 
             if kind == "retryable":
                 retry_info = data
                 logger.info("provider=%s status=%s path=%s", provider_name, retry_info["status"], path)
-                append_request_log(request_log_entry(provider_name, retry_info["status"], started_at, fallback_count, retry_info["detail"], streamed=stream, path=path))
+                append_request_log(request_log_entry(provider_name, retry_info["status"], started_at, fallback_count, retry_info["detail"], streamed=stream, path=path, model=log_model, client_key=client_key_label))
                 if retry_info["status"] == 429:
                     record_key_cooldown(provider_name, api_key)
                 last_error = retry_info["detail"]
@@ -407,7 +480,7 @@ async def _iterate_providers(
                 record_success(provider_name, data, key_count, key_index)
             else:
                 record_success(provider_name, httpx.Response(200, json={}), key_count, key_index)
-            return callback(data, provider_name, started_at, fallback_count, key_attempts, key_index, client, stream, path)
+            return callback(data, provider_name, started_at, fallback_count, key_attempts, key_index, client, stream, path, log_model, client_key_label)
 
     raise HTTPException(status_code=502, detail=last_error)
 
@@ -422,9 +495,11 @@ def _stream_callback(
     client: httpx.AsyncClient,
     stream: bool,
     path: str,
+    log_model: str | None,
+    client_key_label: str | None,
 ) -> StreamingResponse:
     if isinstance(data, httpx.Response):
-        log_entry = request_log_entry(provider_name, data.status_code, started_at, fallback_count, streamed=True, path=path)
+        log_entry = request_log_entry(provider_name, data.status_code, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label)
         return StreamingResponse(
             stream_response_bytes(data, client, log_entry),
             media_type=data.headers.get("content-type", "text/event-stream"),
@@ -436,13 +511,13 @@ def _stream_callback(
             yield chunk
 
     if hasattr(data, "__aiter__"):
-        log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path)
+        log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label)
         log_entry["stream_status"] = "stream_complete"
         append_request_log(log_entry)
         return StreamingResponse(_curl_stream_gen(data), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path)
+    log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label)
     log_entry["stream_status"] = "stream_complete"
     append_request_log(log_entry)
     payload = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
@@ -459,8 +534,10 @@ def _json_callback(
     client: httpx.AsyncClient,
     stream: bool,
     path: str,
+    log_model: str | None,
+    client_key_label: str | None,
 ) -> JSONResponse:
-    append_request_log(request_log_entry(provider_name, 200, started_at, fallback_count, path=path))
+    append_request_log(request_log_entry(provider_name, 200, started_at, fallback_count, path=path, model=log_model, client_key=client_key_label))
     content = data.json() if isinstance(data, httpx.Response) else data
     return JSONResponse(content=content, status_code=200)
 
@@ -473,7 +550,13 @@ async def stream_chat_completions(
     fwd: dict[str, Any] | None = None,
 ) -> StreamingResponse:
     client = get_http_client(request.app) if request else create_http_client()
-    return await _iterate_providers(body, config, client, _stream_callback, stream=True, path=path, fwd=fwd)
+    client_key_label = getattr(request.state, "client_key_label", None) if request else None
+    return await _iterate_providers(
+        body, config, client, _stream_callback,
+        stream=True, path=path, fwd=fwd,
+        log_model=_request_model_for_log(body, path, config.get("default_model", "gpt-3.5-turbo")),
+        client_key_label=client_key_label,
+    )
 
 
 async def proxy_chat_json(
@@ -484,7 +567,13 @@ async def proxy_chat_json(
     fwd: dict[str, Any] | None = None,
 ) -> JSONResponse:
     client = get_http_client(request.app) if request else create_http_client()
-    return await _iterate_providers(body, config, client, _json_callback, stream=False, path=path, fwd=fwd)
+    client_key_label = getattr(request.state, "client_key_label", None) if request else None
+    return await _iterate_providers(
+        body, config, client, _json_callback,
+        stream=False, path=path, fwd=fwd,
+        log_model=_request_model_for_log(body, path, config.get("default_model", "gpt-3.5-turbo")),
+        client_key_label=client_key_label,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +776,12 @@ def protocols_endpoint(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/api/provider-presets")
+def provider_presets_endpoint(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    return {"presets": provider_presets()}
+
+
 @app.get("/api/config")
 def get_config(request: Request) -> dict[str, Any]:
     require_proxy_access(request)
@@ -697,6 +792,10 @@ def get_config(request: Request) -> dict[str, Any]:
         "providers": [
             editable_provider(provider, state, config.get("default_model", "gpt-3.5-turbo"))
             for provider in sorted(config.get("providers", []), key=lambda item: item.get("priority", 1000))
+        ],
+        "client_keys": [
+            editable_client_key(client_key)
+            for client_key in config.get("client_keys", [])
         ],
         "security": {
             "proxy_access_token_enabled": bool(PROXY_ACCESS_TOKEN),
@@ -792,6 +891,12 @@ def recent_requests(request: Request) -> dict[str, Any]:
     require_proxy_access(request)
     state = load_state()
     return {"requests": state.get("_requests", [])[:REQUEST_LOG_LIMIT]}
+
+
+@app.get("/api/stats")
+def request_stats(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    return summarize_request_stats(load_state())
 
 
 @app.post("/api/providers/{provider_name}/check")

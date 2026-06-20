@@ -59,6 +59,146 @@ PROTOCOL_CATALOG: dict[str, dict[str, str]] = {
     },
 }
 
+PROVIDER_PRESETS: list[dict[str, Any]] = [
+    {
+        "id": "openai",
+        "name": "OpenAI",
+        "protocol": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o",
+        "description": "OpenAI 官方 API",
+        "website": "https://platform.openai.com/",
+        "api_key_url": "https://platform.openai.com/api-keys",
+        "model_aliases": {"gpt-4": "gpt-4o", "gpt-3.5-turbo": "gpt-4o-mini"},
+    },
+    {
+        "id": "deepseek",
+        "name": "DeepSeek",
+        "protocol": "domestic",
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+        "description": "DeepSeek OpenAI 兼容入口",
+        "website": "https://platform.deepseek.com/",
+        "api_key_url": "https://platform.deepseek.com/api_keys",
+        "model_aliases": {"gpt-4o": "deepseek-chat", "gpt-3.5-turbo": "deepseek-chat"},
+    },
+    {
+        "id": "qwen",
+        "name": "通义千问",
+        "protocol": "domestic",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-max",
+        "description": "阿里百炼 DashScope 兼容模式",
+        "website": "https://bailian.console.aliyun.com/",
+        "model_aliases": {"gpt-4o": "qwen-max", "gpt-3.5-turbo": "qwen-plus"},
+    },
+    {
+        "id": "glm",
+        "name": "智谱 GLM",
+        "protocol": "domestic",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-4-plus",
+        "description": "智谱 BigModel OpenAI 兼容入口",
+        "website": "https://open.bigmodel.cn/",
+        "model_aliases": {"gpt-4o": "glm-4-plus", "gpt-3.5-turbo": "glm-4-flash"},
+    },
+    {
+        "id": "moonshot",
+        "name": "Moonshot / Kimi",
+        "protocol": "domestic",
+        "base_url": "https://api.moonshot.cn/v1",
+        "model": "kimi-k2.6",
+        "description": "Moonshot OpenAI 兼容入口",
+        "website": "https://platform.moonshot.cn/",
+        "model_aliases": {"gpt-4o": "kimi-k2.6"},
+    },
+    {
+        "id": "siliconflow",
+        "name": "SiliconFlow",
+        "protocol": "domestic",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "model": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        "description": "硅基流动 OpenAI 兼容入口",
+        "website": "https://cloud.siliconflow.cn/",
+        "model_aliases": {"gpt-4o": "Qwen/Qwen3-Coder-480B-A35B-Instruct"},
+    },
+    {
+        "id": "openrouter",
+        "name": "OpenRouter",
+        "protocol": "domestic",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "openai/gpt-4o-mini",
+        "description": "OpenRouter 多模型聚合入口",
+        "website": "https://openrouter.ai/",
+        "api_key_url": "https://openrouter.ai/keys",
+        "model_aliases": {"gpt-4o": "openai/gpt-4o", "gpt-3.5-turbo": "openai/gpt-4o-mini"},
+    },
+    {
+        "id": "aihubmix",
+        "name": "AiHubMix",
+        "protocol": "domestic",
+        "base_url": "https://aihubmix.com/v1",
+        "model": "gpt-4o-mini",
+        "description": "AiHubMix OpenAI 兼容入口",
+        "website": "https://aihubmix.com/",
+    },
+    {
+        "id": "doubao",
+        "name": "豆包 / 火山方舟",
+        "protocol": "domestic",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "model": "doubao-seed-1-6",
+        "description": "火山方舟 OpenAI 兼容入口",
+        "website": "https://www.volcengine.com/product/ark",
+        "model_aliases": {"gpt-4o": "doubao-seed-1-6"},
+    },
+    {
+        "id": "baidu_qianfan",
+        "name": "百度千帆",
+        "protocol": "domestic",
+        "base_url": "https://qianfan.baidubce.com/v2",
+        "model": "ernie-4.5-turbo-128k",
+        "description": "百度千帆 OpenAI 兼容入口",
+        "website": "https://qianfan.cloud.baidu.com/",
+    },
+    {
+        "id": "minimax",
+        "name": "MiniMax",
+        "protocol": "domestic",
+        "base_url": "https://api.minimaxi.com/v1",
+        "model": "MiniMax-M1",
+        "description": "MiniMax OpenAI 兼容入口",
+        "website": "https://www.minimaxi.com/",
+    },
+    {
+        "id": "modelscope",
+        "name": "ModelScope",
+        "protocol": "domestic",
+        "base_url": "https://api-inference.modelscope.cn/v1",
+        "model": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        "description": "魔搭社区模型推理 OpenAI 兼容入口",
+        "website": "https://modelscope.cn/",
+    },
+    {
+        "id": "claude",
+        "name": "Claude",
+        "protocol": "claude",
+        "base_url": "https://api.anthropic.com/v1",
+        "model": "claude-sonnet-4-20250514",
+        "description": "Anthropic Claude 原生 Messages API",
+        "website": "https://console.anthropic.com/",
+    },
+    {
+        "id": "gemini",
+        "name": "Gemini",
+        "protocol": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "model": "gemini-2.0-flash",
+        "description": "Google Gemini 原生 API",
+        "website": "https://aistudio.google.com/",
+    },
+]
+
 VALID_PROTOCOLS = set(PROTOCOL_CATALOG)
 ANTHROPIC_VERSION = "2023-06-01"
 GEMINI_API_VERSION = "v1beta"
@@ -84,6 +224,10 @@ def provider_protocol(provider: dict[str, Any]) -> str:
 
 def protocol_catalog() -> dict[str, dict[str, str]]:
     return {name: dict(info) for name, info in PROTOCOL_CATALOG.items()}
+
+
+def provider_presets() -> list[dict[str, Any]]:
+    return [dict(preset) for preset in PROVIDER_PRESETS]
 
 
 def resolve_model(body: dict[str, Any], provider: dict[str, Any], default_model: str) -> str:
