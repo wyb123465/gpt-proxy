@@ -4,6 +4,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 import main
+from main.proxy import stream_callback
 
 
 def write_config(path, providers):
@@ -2740,7 +2741,7 @@ def test_curl_streaming_logs_error_after_iterator_failure(tmp_path, monkeypatch)
         yield b"data: partial\n\n"
         raise RuntimeError("curl stream failed")
 
-    response = main._stream_callback(
+    response = stream_callback(
         failing_stream(),
         "official",
         main.time.perf_counter(),
@@ -2753,6 +2754,7 @@ def test_curl_streaming_logs_error_after_iterator_failure(tmp_path, monkeypatch)
         "gpt-4o",
         "",
         None,
+        main.proxy_services(),
     )
 
     async def consume_stream():
