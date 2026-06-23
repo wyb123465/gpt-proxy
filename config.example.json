@@ -6,11 +6,8 @@
       "base_url": "https://api.openai.com/v1",
       "model": "gpt-4o",
       "priority": 0,
-      "enabled": true,
-      "api_keys": [
-        "sk-your-openai-key-1",
-        "sk-your-openai-key-2"
-      ],
+      "enabled": false,
+      "api_keys": [],
       "use_curl": false,
       "model_aliases": {
         "gpt-4": "gpt-4o"
@@ -22,10 +19,8 @@
       "base_url": "https://api.anthropic.com/v1",
       "model": "claude-sonnet-4-20250514",
       "priority": 1,
-      "enabled": true,
-      "api_keys": [
-        "sk-ant-your-claude-key"
-      ],
+      "enabled": false,
+      "api_keys": [],
       "use_curl": false
     },
     {
@@ -34,10 +29,8 @@
       "base_url": "https://generativelanguage.googleapis.com/v1beta",
       "model": "gemini-2.0-flash",
       "priority": 2,
-      "enabled": true,
-      "api_keys": [
-        "your-gemini-api-key"
-      ],
+      "enabled": false,
+      "api_keys": [],
       "use_curl": false
     },
     {
@@ -46,10 +39,8 @@
       "base_url": "https://api.deepseek.com/v1",
       "model": "deepseek-chat",
       "priority": 3,
-      "enabled": true,
-      "api_keys": [
-        "sk-your-deepseek-key"
-      ],
+      "enabled": false,
+      "api_keys": [],
       "use_curl": false,
       "model_aliases": {
         "gpt-3.5-turbo": "deepseek-chat"
@@ -62,9 +53,7 @@
       "model": "qwen-max",
       "priority": 4,
       "enabled": false,
-      "api_keys": [
-        "sk-your-qwen-key"
-      ],
+      "api_keys": [],
       "use_curl": false
     },
     {
@@ -74,9 +63,7 @@
       "model": "glm-4-plus",
       "priority": 5,
       "enabled": false,
-      "api_keys": [
-        "your-glm-key"
-      ],
+      "api_keys": [],
       "use_curl": false
     }
   ],
@@ -84,8 +71,8 @@
     {
       "id": "chatbox",
       "label": "ChatBox",
-      "key": "local-client-key",
-      "enabled": true,
+      "key": "",
+      "enabled": false,
       "allowed_models": [
         "gpt-4o",
         "gpt-4o-mini"

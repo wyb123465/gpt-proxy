@@ -5,7 +5,7 @@ from typing import Any, AsyncIterator
 
 import httpx
 
-from ._config import provider_api_keys
+from ._config import provider_api_keys, safe_bool, safe_model_aliases, safe_provider_model
 
 
 def _curl_bin() -> str:
@@ -232,12 +232,13 @@ def provider_presets() -> list[dict[str, Any]]:
 
 def resolve_model(body: dict[str, Any], provider: dict[str, Any], default_model: str) -> str:
     """Resolve the effective model name applying aliases / provider override."""
-    aliases = provider.get("model_aliases") or {}
+    aliases = safe_model_aliases(provider)
     requested_model = body.get("model", "") if isinstance(body, dict) else ""
     if requested_model and requested_model in aliases:
         return aliases[requested_model]
-    if provider.get("model"):
-        return provider["model"]
+    provider_model = safe_provider_model(provider)
+    if provider_model:
+        return provider_model
     return requested_model or default_model
 
 
@@ -293,14 +294,16 @@ def passthrough_body(body: dict[str, Any], provider: dict[str, Any], default_mod
 
 def build_request_body(body: dict[str, Any], provider: dict[str, Any], default_model: str) -> dict[str, Any]:
     request_body = dict(body)
-    aliases = provider.get("model_aliases") or {}
+    aliases = safe_model_aliases(provider)
     requested_model = request_body.get("model", "")
     if requested_model and requested_model in aliases:
         request_body["model"] = aliases[requested_model]
-    elif provider.get("model"):
-        request_body["model"] = provider["model"]
     else:
-        request_body.setdefault("model", default_model)
+        provider_model = safe_provider_model(provider)
+        if provider_model:
+            request_body["model"] = provider_model
+        else:
+            request_body.setdefault("model", default_model)
     return request_body
 
 
@@ -312,7 +315,7 @@ def build_forward_headers(api_key: str) -> dict[str, str]:
 
 
 def should_use_curl(provider: dict[str, Any]) -> bool:
-    return bool(provider.get("use_curl"))
+    return safe_bool(provider.get("use_curl"), False)
 
 
 async def curl_request(

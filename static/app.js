@@ -13,11 +13,15 @@ const overviewProviderList = document.querySelector("#overviewProviderList");
 const overviewProtocolList = document.querySelector("#overviewProtocolList");
 const overviewRequestList = document.querySelector("#overviewRequestList");
 const providerPresetGrid = document.querySelector("#providerPresetGrid");
+const modelCoverageGrid = document.querySelector("#modelCoverageGrid");
 const checkReport = document.querySelector("#checkReport");
 const diagnosticSummary = document.querySelector("#diagnosticSummary");
 const diagnosticCheckReport = document.querySelector("#diagnosticCheckReport");
 const modelSyncReport = document.querySelector("#modelSyncReport");
 const proxyTokenState = document.querySelector("#proxyTokenState");
+const managementAuthState = document.querySelector("#managementAuthState");
+const v1AuthState = document.querySelector("#v1AuthState");
+const clientKeyCountState = document.querySelector("#clientKeyCountState");
 const encryptionState = document.querySelector("#encryptionState");
 const rateLimitState = document.querySelector("#rateLimitState");
 const bodyLimitState = document.querySelector("#bodyLimitState");
@@ -38,12 +42,15 @@ const viewPanels = Array.from(document.querySelectorAll("[data-view-panel]"));
 const viewJumpButtons = Array.from(document.querySelectorAll("[data-view-jump]"));
 const runDiagnosticsBtn = document.querySelector("#runDiagnosticsBtn");
 const syncModelsBtn = document.querySelector("#syncModelsBtn");
+const refreshModelCoverageBtn = document.querySelector("#refreshModelCoverageBtn");
+const clearObservabilityBtn = document.querySelector("#clearObservabilityBtn");
 
 let providers = [];
 let clientKeys = [];
 let latestRequests = [];
 let latestStats = null;
 let latestSecurity = {};
+let latestRoutingPreview = null;
 let protocolCatalog = {};
 let activeProviderName = "";
 localProxyTokenInput.value = localStorage.getItem("gpt_proxy_access_token") || "";
@@ -423,6 +430,14 @@ function providerMeta(provider) {
 
 function providerChips(provider) {
   const protocol = provider.protocol || "openai";
+  const health = provider.health || {};
+  const healthTone = {
+    healthy: "ok",
+    degraded: "warn",
+    cooldown: "warn",
+    failing: "error",
+    unknown: "",
+  }[health.status] || "";
   const chips = [
     {
       text: provider.enabled === false ? "已停用" : "启用中",
@@ -438,6 +453,7 @@ function providerChips(provider) {
     },
     { text: `优先级 ${provider.priority ?? 0}`, tone: "" },
   ];
+  if (health.label) chips.push({ text: health.label, tone: healthTone });
   if (provider.use_curl) chips.push({ text: "curl 传输", tone: "warn" });
   if (provider.model) chips.push({ text: provider.model, tone: "" });
   return chips;
@@ -521,9 +537,45 @@ function renderOverviewProtocols(protocols = null) {
   });
 }
 
+function authModeLabel(mode) {
+  return {
+    open: "开放",
+    proxy_token: "访问密钥",
+    client_keys: "客户端 Key",
+    proxy_token_or_client_keys: "访问密钥 / 客户端 Key",
+  }[mode] || "未知";
+}
+
+function accessProtectionSummary(security = {}) {
+  const managementProtected = security.management_auth_mode === "proxy_token";
+  const v1Protected = security.v1_auth_mode && security.v1_auth_mode !== "open";
+  if (managementProtected) {
+    return {
+      value: "管理已保护",
+      hint: `V1：${authModeLabel(security.v1_auth_mode)}`,
+      tone: "ok",
+    };
+  }
+  if (v1Protected) {
+    return {
+      value: "仅 V1 已保护",
+      hint: `管理端开放 · V1：${authModeLabel(security.v1_auth_mode)}`,
+      tone: "warn",
+    };
+  }
+  return {
+    value: "未启用",
+    hint: "管理端与 V1 均开放",
+    tone: "warn",
+  };
+}
+
 function renderSecurity(security = {}) {
   latestSecurity = security;
   proxyTokenState.textContent = security.proxy_access_token_enabled ? "已启用" : "未启用";
+  managementAuthState.textContent = authModeLabel(security.management_auth_mode);
+  v1AuthState.textContent = authModeLabel(security.v1_auth_mode);
+  clientKeyCountState.textContent = `${security.enabled_client_key_count || 0} 个已启用客户端 Key`;
   encryptionState.textContent = security.config_encryption_enabled ? "已启用" : "未启用";
   rateLimitState.textContent = security.rate_limit_per_minute > 0 ? `${security.rate_limit_per_minute}/分钟` : "未启用";
   bodyLimitState.textContent = security.max_request_bytes ? `${Math.round(security.max_request_bytes / 1024)} KB` : "未限制";
@@ -552,6 +604,26 @@ function diagnosticCard(label, value, hint, tone = "") {
   return card;
 }
 
+function routingPreviewHint(preview) {
+  const baseHint = preview?.message || preview?.candidates?.[0]?.message || preview?.candidates?.[0]?.reason || "按当前配置预览";
+  const skipped = preview?.skipped_providers || [];
+  if (!skipped.length) return baseHint;
+
+  const reasonLabels = {
+    disabled: "停用",
+    missing_name: "缺名称",
+    missing_base_url: "缺 Base URL",
+    missing_key: "缺 key",
+    protocol_mismatch: "协议不匹配",
+  };
+  const examples = skipped
+    .slice(0, 2)
+    .map((provider) => `${provider.name || "未命名"} ${reasonLabels[provider.reason] || provider.reason || "未参与"}`)
+    .join("、");
+  const suffix = skipped.length > 2 ? ` 等 ${skipped.length} 个未参与` : "";
+  return `${baseHint}；未参与：${examples}${suffix}`;
+}
+
 function renderDiagnosticSummary() {
   if (!diagnosticSummary) return;
   const enabledProviders = providers.filter((provider) => provider.enabled !== false);
@@ -561,13 +633,20 @@ function renderDiagnosticSummary() {
   const activeProtocols = Object.entries(protocolCounts)
     .filter(([, count]) => count > 0)
     .map(([protocol]) => protocolLabels[protocol] || protocol);
+  const accessSummary = accessProtectionSummary(latestSecurity);
 
   diagnosticSummary.innerHTML = "";
   diagnosticSummary.append(
     diagnosticCard("已启用 API", enabledProviders.length.toLocaleString("zh-CN"), `${providers.length} 个配置项`, enabledProviders.length ? "ok" : "warn"),
     diagnosticCard("可参与回退", readyProviders.length.toLocaleString("zh-CN"), missingKeys ? `${missingKeys} 个缺少 key` : "密钥状态正常", missingKeys ? "warn" : "ok"),
     diagnosticCard("协议覆盖", activeProtocols.length ? activeProtocols.join(" / ") : "未配置", "当前启用渠道协议", activeProtocols.length ? "" : "warn"),
-    diagnosticCard("访问保护", latestSecurity.proxy_access_token_enabled ? "已启用" : "未启用", "GPT_PROXY_ACCESS_TOKEN", latestSecurity.proxy_access_token_enabled ? "ok" : "warn"),
+    diagnosticCard(
+      "下次 Chat 路由",
+      latestRoutingPreview?.selected_provider || "无可用",
+      routingPreviewHint(latestRoutingPreview),
+      latestRoutingPreview?.selected_provider ? "ok" : "warn"
+    ),
+    diagnosticCard("访问保护", accessSummary.value, accessSummary.hint, accessSummary.tone),
     diagnosticCard("配置加密", latestSecurity.config_encryption_enabled ? "已启用" : "未启用", "GPT_PROXY_CONFIG_SECRET", latestSecurity.config_encryption_enabled ? "ok" : "warn"),
     diagnosticCard("429 冷却", latestSecurity.key_cooldown_seconds ? `${latestSecurity.key_cooldown_seconds} 秒` : "未启用", "免费额度场景建议开启", latestSecurity.key_cooldown_seconds ? "ok" : "warn"),
   );
@@ -578,6 +657,26 @@ function appendChannelCell(row, text, className = "") {
   if (className) cell.className = className;
   cell.textContent = text;
   row.appendChild(cell);
+  return cell;
+}
+
+function providerHealthTone(provider) {
+  if (provider.enabled === false) return "error-text";
+  const status = provider.health?.status;
+  if (status === "healthy") return "ok-text";
+  if (status === "cooldown" || status === "degraded") return "warn-text";
+  if (status === "failing") return "error-text";
+  return "";
+}
+
+function providerHealthText(provider) {
+  if (provider.enabled === false) return "停用";
+  const health = provider.health || {};
+  if (!health.label) return "启用";
+  if (health.status === "cooldown" && health.cooldown_seconds) {
+    return `${health.label} ${health.cooldown_seconds}s`;
+  }
+  return health.label;
 }
 
 function renderChannelOverview() {
@@ -605,7 +704,11 @@ function renderChannelOverview() {
     appendChannelCell(row, String(provider.priority ?? 0));
     appendChannelCell(row, hasKey ? `${provider.key_count || 1}` : "0", hasKey ? "" : "error-text");
     appendChannelCell(row, Number(provider.calls || 0).toLocaleString("zh-CN"));
-    appendChannelCell(row, enabled ? "启用" : "停用", enabled ? "ok-text" : "error-text");
+    const healthCell = appendChannelCell(row, providerHealthText(provider), providerHealthTone(provider));
+    const health = provider.health || {};
+    healthCell.title = health.attempts
+      ? `成功率 ${health.success_rate ?? "-"}%，平均耗时 ${health.avg_latency_ms ?? 0} ms，最近状态 ${health.recent_status ?? "-"}`
+      : "暂无请求数据";
 
     const actionCell = document.createElement("td");
     const button = document.createElement("button");
@@ -766,12 +869,13 @@ async function fetchJson(url, options = {}) {
 
 async function loadConfig() {
   setMessage("正在读取配置...");
-  const [health, detailedHealth, protocolData, presetData, statsData, config] = await Promise.all([
+  const [health, detailedHealth, protocolData, presetData, statsData, routingPreviewData, config] = await Promise.all([
     fetchJson("/health").catch(() => null),
     fetchJson("/health/detailed").catch(() => null),
     fetchJson("/api/protocols").catch(() => null),
     fetchJson("/api/provider-presets").catch(() => null),
     fetchJson("/api/stats").catch(() => null),
+    fetchJson("/api/routing/preview?target=chat").catch(() => null),
     fetchJson("/api/config"),
   ]);
 
@@ -788,6 +892,7 @@ async function loadConfig() {
   defaultModelInput.value = config.default_model || "gpt-4o";
   providers = markSavedProviders(config.providers);
   clientKeys = markSavedClientKeys(config.client_keys || []);
+  latestRoutingPreview = routingPreviewData;
   setProviderPresets(presetData?.presets || providerPresetList);
   renderSecurity(config.security);
   renderClientKeys();
@@ -829,6 +934,7 @@ function collectPayload() {
     })),
     client_keys: clientKeys.map((clientKey) => ({
       id: String(clientKey.id || clientKey._savedId || "").trim(),
+      saved_id: String(clientKey._savedId || "").trim(),
       label: String(clientKey.label || "").trim(),
       key: String(clientKey.key || "").trim(),
       enabled: clientKey.enabled !== false,
@@ -1025,6 +1131,59 @@ function renderModelSyncReport(report) {
   modelSyncReport.appendChild(list);
 }
 
+function renderModelCoverage(report) {
+  if (!modelCoverageGrid) return;
+  modelCoverageGrid.hidden = false;
+  modelCoverageGrid.innerHTML = "";
+
+  const summary = document.createElement("div");
+  summary.className = "coverage-summary-card";
+  const title = document.createElement("strong");
+  title.textContent = `${report.unique_model_count || 0} 个唯一模型`;
+  const hint = document.createElement("span");
+  hint.textContent = `${report.total_providers || 0} 个 API 参与覆盖统计`;
+  summary.append(title, hint);
+  modelCoverageGrid.appendChild(summary);
+
+  const providerCard = document.createElement("div");
+  providerCard.className = "coverage-card";
+  const providerTitle = document.createElement("strong");
+  providerTitle.textContent = "按 API 查看";
+  providerCard.appendChild(providerTitle);
+  (report.providers || []).forEach((provider) => {
+    const row = document.createElement("div");
+    row.className = "coverage-row";
+    const name = document.createElement("span");
+    name.textContent = `${provider.name} · ${protocolLabels[provider.protocol] || provider.protocol}`;
+    const models = document.createElement("small");
+    models.textContent = provider.models?.slice(0, 5).join("、") || provider.detail || "暂无模型";
+    const count = document.createElement("em");
+    count.textContent = `${provider.model_count || 0}`;
+    row.append(name, models, count);
+    providerCard.appendChild(row);
+  });
+  modelCoverageGrid.appendChild(providerCard);
+
+  const modelCard = document.createElement("div");
+  modelCard.className = "coverage-card";
+  const modelTitle = document.createElement("strong");
+  modelTitle.textContent = "按模型查看";
+  modelCard.appendChild(modelTitle);
+  (report.models || []).slice(0, 24).forEach((model) => {
+    const row = document.createElement("div");
+    row.className = "coverage-row";
+    const name = document.createElement("span");
+    name.textContent = model.id;
+    const providersText = document.createElement("small");
+    providersText.textContent = (model.providers || []).join("、") || "-";
+    const count = document.createElement("em");
+    count.textContent = `${model.providers?.length || 0}`;
+    row.append(name, providersText, count);
+    modelCard.appendChild(row);
+  });
+  modelCoverageGrid.appendChild(modelCard);
+}
+
 async function runDiagnostics() {
   runDiagnosticsBtn.disabled = true;
   runDiagnosticsBtn.textContent = "体检中";
@@ -1062,17 +1221,50 @@ async function syncProviderModels() {
   }
 }
 
+async function refreshModelCoverage() {
+  if (!refreshModelCoverageBtn) return;
+  refreshModelCoverageBtn.disabled = true;
+  refreshModelCoverageBtn.textContent = "刷新中";
+  try {
+    await saveConfig();
+    setMessage("正在刷新模型覆盖...");
+    const report = await fetchJson("/api/model-coverage");
+    renderModelCoverage(report);
+    setActiveView("providers");
+    setMessage(`模型覆盖已刷新：${report.unique_model_count || 0} 个唯一模型`, report.unique_model_count ? "ok" : "error");
+  } catch (error) {
+    setMessage(`模型覆盖刷新失败：${error.message}`, "error");
+  } finally {
+    refreshModelCoverageBtn.disabled = false;
+    refreshModelCoverageBtn.textContent = "刷新模型覆盖";
+  }
+}
+
+function downloadJson(data, filename) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 async function exportConfig() {
   try {
     const config = await fetchJson("/api/config/export");
-    const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `gpt-proxy-config-${new Date().toISOString().slice(0, 10)}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadJson(config, `gpt-proxy-config-${new Date().toISOString().slice(0, 10)}.json`);
     setMessage("配置已导出；请妥善保存，里面包含真实密钥", "ok");
+  } catch (error) {
+    setMessage(error.message, "error");
+  }
+}
+
+async function exportRedactedConfig() {
+  try {
+    const config = await fetchJson("/api/config/export?redacted=true");
+    downloadJson(config, `gpt-proxy-config-redacted-${new Date().toISOString().slice(0, 10)}.json`);
+    setMessage("脱敏配置已导出，可用于排查问题，不包含真实密钥", "ok");
   } catch (error) {
     setMessage(error.message, "error");
   }
@@ -1319,7 +1511,7 @@ function renderEmptyRequestRow(text) {
   requestLogBody.innerHTML = "";
   const row = document.createElement("tr");
   const cell = document.createElement("td");
-  cell.colSpan = 10;
+  cell.colSpan = 11;
   cell.className = "empty-cell";
   cell.textContent = text;
   row.appendChild(cell);
@@ -1331,6 +1523,14 @@ function appendRequestCell(row, text, className = "") {
   if (className) cell.className = className;
   cell.textContent = text;
   row.appendChild(cell);
+  return cell;
+}
+
+function routeDecisionText(entry) {
+  const decision = entry.route_decision || {};
+  if (decision.message) return decision.message;
+  if ((entry.fallback_count || 0) > 0) return `第 ${Number(entry.fallback_count || 0) + 1} 次尝试`;
+  return "首选尝试";
 }
 
 function renderOverviewRequests(requests) {
@@ -1379,6 +1579,9 @@ function filteredRequests() {
       entry.path,
       entry.stream_status,
       entry.error,
+      entry.route_decision?.routing_reason,
+      entry.route_decision?.reason,
+      entry.route_decision?.message,
     ]
       .filter((value) => value !== undefined && value !== null)
       .join(" ")
@@ -1414,6 +1617,7 @@ function renderRequests(requests) {
     appendRequestCell(row, String(entry.status ?? "-"), statusClass);
     appendRequestCell(row, `${entry.latency_ms ?? "-"} ms`);
     appendRequestCell(row, String(entry.fallback_count ?? 0));
+    appendRequestCell(row, routeDecisionText(entry), "route-detail");
     appendRequestCell(row, entry.streamed ? "stream" : "json");
     appendRequestCell(row, entry.stream_status || "-");
     appendRequestCell(row, entry.error || "", "error-detail");
@@ -1431,6 +1635,25 @@ async function loadRequests() {
     renderRequests(data.requests || []);
   } catch (error) {
     renderEmptyRequestRow(`读取失败：${error.message}`);
+  }
+}
+
+async function clearObservability() {
+  const confirmed = window.confirm("确定清空最近请求和请求统计吗？不会删除 API 配置，也不会重置 provider 冷却状态。");
+  if (!confirmed) return;
+
+  clearObservabilityBtn.disabled = true;
+  clearObservabilityBtn.textContent = "清空中";
+  try {
+    const data = await fetchJson("/api/observability", { method: "DELETE" });
+    renderRequestStats(data.stats);
+    renderRequests(data.requests || []);
+    setMessage("最近请求和请求统计已清空", "ok");
+  } catch (error) {
+    setMessage(`清空失败：${error.message}`, "error");
+  } finally {
+    clearObservabilityBtn.disabled = false;
+    clearObservabilityBtn.textContent = "清空观测数据";
   }
 }
 
@@ -1560,7 +1783,9 @@ saveClientKeysBtn.addEventListener("click", () => {
 saveAndTestBtn.addEventListener("click", saveAndTestAll);
 runDiagnosticsBtn.addEventListener("click", runDiagnostics);
 syncModelsBtn.addEventListener("click", syncProviderModels);
+refreshModelCoverageBtn.addEventListener("click", refreshModelCoverage);
 document.querySelector("#exportConfigBtn").addEventListener("click", exportConfig);
+document.querySelector("#exportRedactedConfigBtn").addEventListener("click", exportRedactedConfig);
 document.querySelector("#importConfigBtn").addEventListener("click", () => importConfigFile.click());
 importConfigFile.addEventListener("change", () => importConfig(importConfigFile.files?.[0]));
 document.querySelector("#saveProxyTokenBtn").addEventListener("click", () => {
@@ -1574,6 +1799,7 @@ document.querySelector("#clearProxyTokenBtn").addEventListener("click", () => {
   setMessage("本地代理访问密钥已清除", "ok");
 });
 document.querySelector("#refreshRequestsBtn").addEventListener("click", loadRequests);
+clearObservabilityBtn.addEventListener("click", clearObservability);
 requestStatusFilter.addEventListener("change", () => renderRequests(latestRequests));
 requestSearchInput.addEventListener("input", () => renderRequests(latestRequests));
 document.querySelector("#refreshBtn").addEventListener("click", () => {

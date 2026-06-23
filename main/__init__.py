@@ -17,13 +17,24 @@ from fastapi.staticfiles import StaticFiles
 
 from ._config import (
     apply_env_overrides,
+    client_key_entries,
+    client_key_model_rules,
     decrypt_config,
     editable_client_key,
     editable_provider,
     encrypt_config,
     normalize_config_payload,
     provider_api_keys,
+    provider_with_safe_priority,
     read_json_file,
+    safe_api_key_env,
+    safe_bool,
+    safe_model_aliases,
+    safe_provider_model,
+    safe_provider_base_url,
+    safe_provider_name,
+    safe_provider_priority,
+    safe_secret_value,
     write_json_file,
 )
 from ._providers import (
@@ -41,11 +52,23 @@ from ._providers import (
     safe_response_detail,
     should_use_curl,
 )
-from ._state import key_fingerprint, record_request_stats, request_log_entry, summarize_request_stats
+from ._routing import RoutingCandidate, build_provider_routing_profile, order_providers_for_request
+from ._state import key_fingerprint, record_request_stats, request_log_entry, stats_container, summarize_request_stats
 
 # ---------------------------------------------------------------------------
 # Monkeypatchable module-level constants
 # ---------------------------------------------------------------------------
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name, "")
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 CONFIG_PATH = Path(os.getenv("GPT_PROXY_CONFIG", BASE_DIR / "config.json"))
@@ -54,9 +77,9 @@ RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
 REQUEST_LOG_LIMIT = 50
 PROXY_ACCESS_TOKEN = os.getenv("GPT_PROXY_ACCESS_TOKEN", "").strip()
 CONFIG_ENCRYPTION_SECRET = os.getenv("GPT_PROXY_CONFIG_SECRET", "").strip()
-RATE_LIMIT_PER_MINUTE = int(os.getenv("GPT_PROXY_RATE_LIMIT_PER_MINUTE", "0") or 0)
-MAX_REQUEST_BYTES = int(os.getenv("GPT_PROXY_MAX_REQUEST_BYTES", str(2 * 1024 * 1024)) or 0)
-KEY_COOLDOWN_SECONDS = int(os.getenv("GPT_PROXY_KEY_COOLDOWN_SECONDS", "60") or 0)
+RATE_LIMIT_PER_MINUTE = env_int("GPT_PROXY_RATE_LIMIT_PER_MINUTE", 0)
+MAX_REQUEST_BYTES = env_int("GPT_PROXY_MAX_REQUEST_BYTES", 2 * 1024 * 1024)
+KEY_COOLDOWN_SECONDS = env_int("GPT_PROXY_KEY_COOLDOWN_SECONDS", 60)
 RATE_LIMIT_BUCKETS: dict[str, list[float]] = {}
 _state_cache: dict[str, Any] | None = None
 _state_cache_path: Path | None = None
@@ -107,6 +130,12 @@ def flush_state_cache() -> None:
             write_json_file(STATE_PATH, _state_cache)
 
 
+def is_json_file_content_error(exc: BaseException) -> bool:
+    if isinstance(exc, UnicodeDecodeError):
+        return True
+    return isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeDecodeError))
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     task = asyncio.create_task(_periodic_state_flush())
@@ -121,7 +150,13 @@ async def lifespan(application: FastAPI):
 def load_state() -> dict[str, Any]:
     global _state_cache, _state_cache_path
     if _state_cache is None or _state_cache_path != STATE_PATH:
-        _state_cache = read_json_file(STATE_PATH, {})
+        try:
+            state = read_json_file(STATE_PATH, {})
+        except (RuntimeError, UnicodeDecodeError) as exc:
+            if not is_json_file_content_error(exc):
+                raise
+            state = {}
+        _state_cache = state if isinstance(state, dict) else {}
         _state_cache_path = STATE_PATH
     return _state_cache
 
@@ -134,12 +169,33 @@ def save_state(state: dict[str, Any]) -> None:
         write_json_file(STATE_PATH, state)
 
 
+def provider_state_entry(state: dict[str, Any], provider_name: str, create: bool = False) -> dict[str, Any]:
+    value = state.get(provider_name)
+    if isinstance(value, dict):
+        return value
+    if create:
+        value = {"calls": 0, "last_remaining": None}
+        state[provider_name] = value
+        return value
+    return {}
+
+
+def provider_key_cooldowns(provider_state: dict[str, Any], create: bool = False) -> dict[str, Any]:
+    cooldowns = provider_state.get("key_cooldowns")
+    if isinstance(cooldowns, dict):
+        return cooldowns
+    if create or "key_cooldowns" in provider_state:
+        provider_state["key_cooldowns"] = {}
+        return provider_state["key_cooldowns"]
+    return {}
+
+
 def record_key_cooldown(provider_name: str, api_key: str) -> None:
     if KEY_COOLDOWN_SECONDS <= 0:
         return
     state = load_state()
-    provider_state = state.setdefault(provider_name, {"calls": 0, "last_remaining": None})
-    cooldowns = provider_state.setdefault("key_cooldowns", {})
+    provider_state = provider_state_entry(state, provider_name, create=True)
+    cooldowns = provider_key_cooldowns(provider_state, create=True)
     cooldowns[key_fingerprint(api_key)] = time.time() + KEY_COOLDOWN_SECONDS
     save_state(state)
 
@@ -148,10 +204,10 @@ def key_attempt_order(provider: dict[str, Any], state: dict[str, Any]) -> list[t
     keys = provider_api_keys(provider)
     if not keys:
         return []
-    provider_state = state.get(provider["name"], {})
-    start_index = int(provider_state.get("key_index", 0)) % len(keys)
+    provider_state = provider_state_entry(state, provider["name"])
+    start_index = parse_state_int(provider_state.get("key_index")) % len(keys)
     ordered_indexes = list(range(start_index, len(keys))) + list(range(0, start_index))
-    cooldowns = provider_state.get("key_cooldowns", {})
+    cooldowns = provider_key_cooldowns(provider_state, create=True)
     now = time.time()
     available = []
     cooled = []
@@ -171,8 +227,9 @@ def record_success(
     key_index: int | None = None,
 ) -> None:
     state = load_state()
-    provider_state = state.setdefault(provider_name, {"calls": 0, "last_remaining": None})
-    provider_state["calls"] = int(provider_state.get("calls", 0)) + 1
+    provider_state = provider_state_entry(state, provider_name, create=True)
+    provider_key_cooldowns(provider_state)
+    provider_state["calls"] = parse_state_int(provider_state.get("calls")) + 1
     if key_index is not None and key_count > 0:
         provider_state["key_index"] = (key_index + 1) % key_count
     remaining = response.headers.get("x-ratelimit-remaining")
@@ -187,10 +244,131 @@ def record_success(
 def append_request_log(entry: dict[str, Any]) -> None:
     state = load_state()
     record_request_stats(state, entry)
-    requests = state.setdefault("_requests", [])
+    requests = state.get("_requests")
+    if not isinstance(requests, list):
+        requests = []
+        state["_requests"] = requests
     requests.insert(0, entry)
     del requests[REQUEST_LOG_LIMIT:]
     save_state(state)
+
+
+def route_decision_entry(
+    provider: dict[str, Any],
+    fallback_count: int,
+    key_index: int,
+    key_count: int,
+    previous_provider: str | None = None,
+    previous_status: int | str | None = None,
+    routing_candidate: RoutingCandidate | None = None,
+) -> dict[str, Any]:
+    provider_name = provider.get("name", "unknown")
+    priority = safe_provider_priority(provider)
+    attempt = fallback_count + 1
+    if fallback_count <= 0 and routing_candidate and routing_candidate.reason != "primary":
+        reason = routing_candidate.reason
+        message = routing_candidate.message or f"智能路由优先尝试 {provider_name}。"
+    elif fallback_count <= 0:
+        reason = "primary"
+        message = f"按质量优先顺序选择首个可用 provider：{provider_name}。"
+    elif previous_provider == provider_name:
+        reason = "key_retry"
+        message = f"{provider_name} 的上一个 key 返回 {previous_status}，自动尝试同 provider 的下一个 key。"
+    else:
+        reason = "fallback"
+        previous = previous_provider or "上一个 provider"
+        message = f"{previous} 返回 {previous_status} 后，按优先级回退到 {provider_name}。"
+    return {
+        "reason": reason,
+        "routing_reason": reason,
+        "attempt": attempt,
+        "priority": priority,
+        "key_position": key_index + 1,
+        "key_count": key_count,
+        "message": message,
+    }
+
+
+def parse_state_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_state_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def request_log_entries(state: dict[str, Any], limit: int | None = None) -> list[dict[str, Any]]:
+    requests = state.get("_requests")
+    if not isinstance(requests, list):
+        return []
+    entries = [item for item in requests if isinstance(item, dict)]
+    return entries[:limit] if limit is not None else entries
+
+
+def provider_health(provider_name: str, provider_state: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    provider_stats_group = stats_container(state).get("providers")
+    if not isinstance(provider_stats_group, dict):
+        provider_stats_group = {}
+    provider_stats = provider_stats_group.get(provider_name) or {}
+    if not isinstance(provider_stats, dict):
+        provider_stats = {}
+    attempts = parse_state_int(provider_stats.get("attempts"))
+    success = parse_state_int(provider_stats.get("success"))
+    failed = parse_state_int(provider_stats.get("failed"))
+    latency_total = parse_state_float(provider_stats.get("latency_ms_total"))
+    now = time.time()
+    cooldown_values = []
+    for value in provider_key_cooldowns(provider_state).values():
+        try:
+            cooldown_until = float(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if cooldown_until > now:
+            cooldown_values.append(cooldown_until)
+    recent_request = next(
+        (
+            item for item in request_log_entries(state)
+            if item.get("provider") == provider_name
+        ),
+        {},
+    )
+
+    if cooldown_values:
+        status = "cooldown"
+        label = "冷却中"
+    elif attempts == 0:
+        status = "unknown"
+        label = "暂无请求"
+    elif failed == 0:
+        status = "healthy"
+        label = "健康"
+    elif success > 0:
+        status = "degraded"
+        label = "有波动"
+    else:
+        status = "failing"
+        label = "失败"
+
+    return {
+        "status": status,
+        "label": label,
+        "attempts": attempts,
+        "success": success,
+        "failed": failed,
+        "success_rate": round(success / attempts * 100, 1) if attempts else None,
+        "avg_latency_ms": round(latency_total / attempts, 2) if attempts else 0,
+        "recent_status": recent_request.get("status"),
+        "recent_error": recent_request.get("error"),
+        "recent_time": recent_request.get("time"),
+        "cooldown_key_count": len(cooldown_values),
+        "cooldown_seconds": max(0, int(max(cooldown_values) - now)) if cooldown_values else 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -201,26 +379,43 @@ def write_config_file(config: dict[str, Any]) -> None:
     write_json_file(CONFIG_PATH, encrypt_config(config))
 
 
+def safe_default_model(value: Any, default: str = "gpt-3.5-turbo") -> str:
+    if not isinstance(value, str):
+        return default
+    return value.strip() or default
+
+
 def load_raw_config() -> dict[str, Any]:
-    config = decrypt_config(read_json_file(CONFIG_PATH, {"providers": [], "default_model": "gpt-3.5-turbo"}))
+    default_config = {"providers": [], "default_model": "gpt-3.5-turbo"}
+    try:
+        raw_config = read_json_file(CONFIG_PATH, default_config)
+    except (RuntimeError, UnicodeDecodeError) as exc:
+        if not is_json_file_content_error(exc):
+            raise
+        raw_config = default_config
+
+    config = decrypt_config(raw_config)
     config.setdefault("providers", [])
-    config.setdefault("default_model", "gpt-3.5-turbo")
+    config["default_model"] = safe_default_model(config.get("default_model"))
     config.setdefault("client_keys", [])
     return config
 
 
 def load_config() -> dict[str, Any]:
     config = load_raw_config()
-    providers = [apply_env_overrides(provider) for provider in config.get("providers", [])]
-    providers = [
-        provider
-        for provider in providers
-        if provider.get("enabled", True)
-        and provider.get("name")
-        and provider.get("base_url")
-        and provider_api_keys(provider)
-    ]
-    config["providers"] = sorted(providers, key=lambda item: item.get("priority", 1000))
+    providers = []
+    for raw_provider in config.get("providers", []):
+        provider = apply_env_overrides(raw_provider)
+        name = safe_provider_name(provider)
+        base_url = safe_provider_base_url(provider)
+        if safe_bool(provider.get("enabled"), True) and name and base_url and provider_api_keys(provider):
+            provider = dict(provider)
+            provider["name"] = name
+            provider["base_url"] = base_url
+            provider["model"] = safe_provider_model(provider)
+            providers.append(provider)
+    providers = [provider_with_safe_priority(provider) for provider in providers]
+    config["providers"] = sorted(providers, key=safe_provider_priority)
     return config
 
 
@@ -231,9 +426,7 @@ def load_config() -> dict[str, Any]:
 def require_proxy_access(request: Request) -> None:
     if not PROXY_ACCESS_TOKEN:
         return
-    auth_header = request.headers.get("authorization", "")
-    x_api_key = request.headers.get("x-api-key", "")
-    if auth_header == f"Bearer {PROXY_ACCESS_TOKEN}" or x_api_key == PROXY_ACCESS_TOKEN:
+    if hmac.compare_digest(_request_token(request), PROXY_ACCESS_TOKEN):
         return
     raise HTTPException(status_code=401, detail="Missing or invalid local proxy access token")
 
@@ -249,9 +442,33 @@ def _request_token(request: Request) -> str:
 def _enabled_client_keys() -> list[dict[str, Any]]:
     return [
         client_key
-        for client_key in load_raw_config().get("client_keys", [])
-        if client_key.get("enabled", True) and str(client_key.get("key", "")).strip()
+        for client_key in client_key_entries(load_raw_config())
+        if safe_bool(client_key.get("enabled"), True) and safe_secret_value(client_key.get("key", ""))
     ]
+
+
+def enabled_client_key_count(config: dict[str, Any]) -> int:
+    return sum(
+        1
+        for client_key in client_key_entries(config)
+        if safe_bool(client_key.get("enabled"), True) and safe_secret_value(client_key.get("key", ""))
+    )
+
+
+def management_auth_mode() -> str:
+    return "proxy_token" if PROXY_ACCESS_TOKEN else "open"
+
+
+def v1_auth_mode(config: dict[str, Any]) -> str:
+    has_proxy_token = bool(PROXY_ACCESS_TOKEN)
+    has_client_keys = enabled_client_key_count(config) > 0
+    if has_proxy_token and has_client_keys:
+        return "proxy_token_or_client_keys"
+    if has_proxy_token:
+        return "proxy_token"
+    if has_client_keys:
+        return "client_keys"
+    return "open"
 
 
 def _model_matches_any(model: str, patterns: list[str]) -> bool:
@@ -259,44 +476,67 @@ def _model_matches_any(model: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(normalized, pattern.strip().lower()) for pattern in patterns if pattern.strip())
 
 
+def _model_allowed_for_client_key(client_key: dict[str, Any], model: str | None) -> bool:
+    if not model:
+        return True
+    allowed_models = client_key_model_rules(client_key, "allowed_models")
+    excluded_models = client_key_model_rules(client_key, "excluded_models")
+    if allowed_models and not _model_matches_any(model, allowed_models):
+        return False
+    if excluded_models and _model_matches_any(model, excluded_models):
+        return False
+    return True
+
+
 def _authorize_model_for_client_key(client_key: dict[str, Any], model: str | None) -> None:
     if not model:
         return
-    allowed_models = [str(item) for item in client_key.get("allowed_models", [])]
-    excluded_models = [str(item) for item in client_key.get("excluded_models", [])]
+    allowed_models = client_key_model_rules(client_key, "allowed_models")
+    excluded_models = client_key_model_rules(client_key, "excluded_models")
     if allowed_models and not _model_matches_any(model, allowed_models):
         raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this local client key")
     if excluded_models and _model_matches_any(model, excluded_models):
         raise HTTPException(status_code=403, detail=f"Model '{model}' is excluded for this local client key")
 
 
-def authorize_v1_request(request: Request, body: dict[str, Any]) -> None:
+def authorize_v1_access(request: Request, model: str | None = None) -> dict[str, Any] | None:
     token = _request_token(request)
     if PROXY_ACCESS_TOKEN and hmac.compare_digest(token, PROXY_ACCESS_TOKEN):
         request.state.client_key_label = "proxy-token"
-        return
+        return None
 
     client_keys = _enabled_client_keys()
     if not client_keys:
         if PROXY_ACCESS_TOKEN:
             raise HTTPException(status_code=401, detail="Missing or invalid local proxy access token")
         request.state.client_key_label = ""
-        return
+        return None
 
     for client_key in client_keys:
-        if hmac.compare_digest(token, str(client_key.get("key", ""))):
+        if hmac.compare_digest(token, safe_secret_value(client_key.get("key", ""))):
             request.state.client_key_label = client_key.get("label") or client_key.get("id") or "client-key"
-            model = str(body.get("model", "")).strip() if isinstance(body, dict) else ""
-            _authorize_model_for_client_key(client_key, model or None)
-            return
+            _authorize_model_for_client_key(client_key, model)
+            return client_key
     raise HTTPException(status_code=401, detail="Missing or invalid local client API key")
+
+
+def authorize_v1_request(request: Request, body: dict[str, Any]) -> dict[str, Any] | None:
+    model = str(body.get("model", "")).strip() if isinstance(body, dict) else ""
+    return authorize_v1_access(request, model or None)
+
+
+def rate_limit_identity(request: Request) -> str:
+    token = _request_token(request)
+    if token:
+        return f"token:{key_fingerprint(token)}"
+    client_host = request.client.host if request.client else "local"
+    return f"host:{client_host}"
 
 
 def enforce_rate_limit(request: Request) -> None:
     if RATE_LIMIT_PER_MINUTE <= 0:
         return
-    client_host = request.client.host if request.client else "local"
-    identity = request.headers.get("authorization") or request.headers.get("x-api-key") or client_host
+    identity = rate_limit_identity(request)
     now = time.time()
     window_start = now - 60
 
@@ -313,14 +553,23 @@ def enforce_rate_limit(request: Request) -> None:
     RATE_LIMIT_BUCKETS[identity] = bucket
 
 
-async def read_v1_json_body(request: Request) -> dict[str, Any]:
+async def read_json_body(request: Request) -> Any:
     raw = await request.body()
     if MAX_REQUEST_BYTES > 0 and len(raw) > MAX_REQUEST_BYTES:
         raise HTTPException(status_code=413, detail="Request body is too large")
     try:
         body = json.loads(raw.decode("utf-8")) if raw else {}
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
+    return body
+
+
+async def read_v1_json_body(request: Request) -> dict[str, Any]:
+    body = await read_json_body(request)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON request body must be an object")
+    if "model" in body and not isinstance(body["model"], str):
+        raise HTTPException(status_code=400, detail="model must be a string")
     authorize_v1_request(request, body)
     enforce_rate_limit(request)
     return body
@@ -442,33 +691,49 @@ async def _iterate_providers(
     fallback_count = 0
     state = load_state()
     log_model = log_model or _request_model_for_log(body, path, config.get("default_model", "gpt-3.5-turbo"))
+    previous_provider: str | None = None
+    previous_status: int | str | None = None
 
-    for provider in config["providers"]:
+    for routing_candidate in order_providers_for_request(config["providers"], state):
+        provider = routing_candidate.provider
         provider_name = provider["name"]
         key_attempts = key_attempt_order(provider, state)
         key_count = len(provider_api_keys(provider))
         for key_index, api_key in key_attempts:
             started_at = time.perf_counter()
+            route_decision = route_decision_entry(
+                provider,
+                fallback_count,
+                key_index,
+                key_count,
+                previous_provider=previous_provider,
+                previous_status=previous_status,
+                routing_candidate=routing_candidate,
+            )
             try:
                 kind, data = await _try_provider(client, body, provider, config["default_model"], api_key, stream, fwd)
             except httpx.RequestError as exc:
                 logger.info("provider=%s status=request_error path=%s", provider_name, path)
                 last_error = str(exc)
-                append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error, streamed=stream, path=path, model=log_model, client_key=client_key_label))
+                append_request_log(request_log_entry(provider_name, "request_error", started_at, fallback_count, last_error, streamed=stream, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision))
+                previous_provider = provider_name
+                previous_status = "request_error"
                 fallback_count += 1
                 continue
             except HTTPException as exc:
                 logger.info("provider=%s status=%s path=%s", provider_name, exc.status_code, path)
-                append_request_log(request_log_entry(provider_name, exc.status_code, started_at, fallback_count, streamed=stream, path=path, model=log_model, client_key=client_key_label))
+                append_request_log(request_log_entry(provider_name, exc.status_code, started_at, fallback_count, streamed=stream, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision))
                 raise
 
             if kind == "retryable":
                 retry_info = data
                 logger.info("provider=%s status=%s path=%s", provider_name, retry_info["status"], path)
-                append_request_log(request_log_entry(provider_name, retry_info["status"], started_at, fallback_count, retry_info["detail"], streamed=stream, path=path, model=log_model, client_key=client_key_label))
+                append_request_log(request_log_entry(provider_name, retry_info["status"], started_at, fallback_count, retry_info["detail"], streamed=stream, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision))
                 if retry_info["status"] == 429:
                     record_key_cooldown(provider_name, api_key)
                 last_error = retry_info["detail"]
+                previous_provider = provider_name
+                previous_status = retry_info["status"]
                 fallback_count += 1
                 continue
 
@@ -480,7 +745,7 @@ async def _iterate_providers(
                 record_success(provider_name, data, key_count, key_index)
             else:
                 record_success(provider_name, httpx.Response(200, json={}), key_count, key_index)
-            return callback(data, provider_name, started_at, fallback_count, key_attempts, key_index, client, stream, path, log_model, client_key_label)
+            return callback(data, provider_name, started_at, fallback_count, key_attempts, key_index, client, stream, path, log_model, client_key_label, route_decision)
 
     raise HTTPException(status_code=502, detail=last_error)
 
@@ -497,9 +762,10 @@ def _stream_callback(
     path: str,
     log_model: str | None,
     client_key_label: str | None,
+    route_decision: dict[str, Any] | None,
 ) -> StreamingResponse:
     if isinstance(data, httpx.Response):
-        log_entry = request_log_entry(provider_name, data.status_code, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label)
+        log_entry = request_log_entry(provider_name, data.status_code, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision)
         return StreamingResponse(
             stream_response_bytes(data, client, log_entry),
             media_type=data.headers.get("content-type", "text/event-stream"),
@@ -511,13 +777,13 @@ def _stream_callback(
             yield chunk
 
     if hasattr(data, "__aiter__"):
-        log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label)
+        log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision)
         log_entry["stream_status"] = "stream_complete"
         append_request_log(log_entry)
         return StreamingResponse(_curl_stream_gen(data), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label)
+    log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision)
     log_entry["stream_status"] = "stream_complete"
     append_request_log(log_entry)
     payload = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
@@ -536,8 +802,9 @@ def _json_callback(
     path: str,
     log_model: str | None,
     client_key_label: str | None,
+    route_decision: dict[str, Any] | None,
 ) -> JSONResponse:
-    append_request_log(request_log_entry(provider_name, 200, started_at, fallback_count, path=path, model=log_model, client_key=client_key_label))
+    append_request_log(request_log_entry(provider_name, 200, started_at, fallback_count, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision))
     content = data.json() if isinstance(data, httpx.Response) else data
     return JSONResponse(content=content, status_code=200)
 
@@ -701,19 +968,43 @@ async def gemini_generate(rest: str, request: Request):
     return await _passthrough(body, config, request, "gemini", path_suffix, f"/v1beta/models/{rest}")
 
 
+def normalize_model_entries(models: Any) -> list[dict[str, Any]]:
+    if not isinstance(models, list):
+        return []
+    normalized = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("id") or model.get("name") or "").removeprefix("models/").strip()
+        if not model_id:
+            continue
+        item = dict(model)
+        item["id"] = model_id
+        item.setdefault("object", "model")
+        normalized.append(item)
+    return normalized
+
+
 @app.get("/v1/models")
 async def list_models(request: Request) -> dict[str, Any]:
-    require_proxy_access(request)
+    client_key = authorize_v1_access(request)
     enforce_rate_limit(request)
     config = load_config()
     seen = set()
     models = []
     for provider in config["providers"]:
-        provider_models = await fetch_provider_models(provider)
+        try:
+            provider_models = await fetch_provider_models(provider)
+        except Exception as exc:
+            logger.info("provider=%s status=model_fetch_error detail=%s", provider.get("name", "unknown"), exc)
+            provider_models = []
+        provider_models = normalize_model_entries(provider_models)
         if not provider_models and provider.get("model"):
-            provider_models = [{"id": provider["model"], "object": "model"}]
+            provider_models = normalize_model_entries([{"id": provider["model"], "object": "model"}])
         for model in provider_models:
             model_id = model["id"]
+            if client_key and not _model_allowed_for_client_key(client_key, model_id):
+                continue
             if model_id in seen:
                 continue
             seen.add(model_id)
@@ -790,15 +1081,22 @@ def get_config(request: Request) -> dict[str, Any]:
     return {
         "default_model": config.get("default_model", "gpt-3.5-turbo"),
         "providers": [
-            editable_provider(provider, state, config.get("default_model", "gpt-3.5-turbo"))
-            for provider in sorted(config.get("providers", []), key=lambda item: item.get("priority", 1000))
+            editable_provider(
+                provider_with_safe_priority(provider),
+                state,
+                config.get("default_model", "gpt-3.5-turbo"),
+            )
+            for provider in sorted(config.get("providers", []), key=safe_provider_priority)
         ],
         "client_keys": [
             editable_client_key(client_key)
-            for client_key in config.get("client_keys", [])
+            for client_key in client_key_entries(config)
         ],
         "security": {
             "proxy_access_token_enabled": bool(PROXY_ACCESS_TOKEN),
+            "management_auth_mode": management_auth_mode(),
+            "v1_auth_mode": v1_auth_mode(config),
+            "enabled_client_key_count": enabled_client_key_count(config),
             "config_encryption_enabled": bool(CONFIG_ENCRYPTION_SECRET),
             "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
             "max_request_bytes": MAX_REQUEST_BYTES,
@@ -807,14 +1105,49 @@ def get_config(request: Request) -> dict[str, Any]:
     }
 
 
+def redacted_config_export(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "redacted": True,
+        "default_model": config.get("default_model", "gpt-3.5-turbo"),
+        "providers": [
+            {
+                "name": safe_provider_name(provider),
+                "protocol": provider_protocol(provider),
+                "base_url": safe_provider_base_url(provider),
+                "model": safe_provider_model(provider) or config.get("default_model", "gpt-3.5-turbo"),
+                "priority": safe_provider_priority(provider),
+                "enabled": safe_bool(provider.get("enabled"), True),
+                "api_key": "",
+                "api_keys": [],
+                "api_key_env": safe_api_key_env(provider),
+                "has_api_key": bool(provider_api_keys(provider)),
+                "key_count": len(provider_api_keys(provider)),
+                "use_curl": safe_bool(provider.get("use_curl"), False),
+                "model_aliases": safe_model_aliases(provider),
+            }
+            for provider in sorted(config.get("providers", []), key=safe_provider_priority)
+        ],
+        "client_keys": [
+            {
+                "id": client_key.get("id", ""),
+                "label": client_key.get("label", ""),
+                "key": "",
+                "has_key": bool(safe_secret_value(client_key.get("key", ""))),
+                "enabled": safe_bool(client_key.get("enabled"), True),
+                "allowed_models": client_key_model_rules(client_key, "allowed_models"),
+                "excluded_models": client_key_model_rules(client_key, "excluded_models"),
+            }
+            for client_key in client_key_entries(config)
+        ],
+    }
+
+
 @app.post("/api/config")
 async def save_config(request: Request) -> dict[str, Any]:
     require_proxy_access(request)
     try:
-        payload = await request.json()
+        payload = await read_json_body(request)
         config = normalize_config_payload(payload, load_raw_config())
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     write_config_file(config)
@@ -844,19 +1177,22 @@ def delete_provider(provider_name: str, request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/config/export")
-def export_config(request: Request) -> dict[str, Any]:
+def export_config(request: Request, redacted: bool = False) -> dict[str, Any]:
     require_proxy_access(request)
-    return load_raw_config()
+    config = load_raw_config()
+    if redacted:
+        return redacted_config_export(config)
+    return config
 
 
 @app.post("/api/config/import")
 async def import_config(request: Request) -> dict[str, Any]:
     require_proxy_access(request)
     try:
-        payload = await request.json()
+        payload = await read_json_body(request)
+        if isinstance(payload, dict) and payload.get("redacted") is True:
+            raise ValueError("Redacted config exports cannot be imported because secrets are omitted")
         config = normalize_config_payload(payload, {"providers": []})
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     write_config_file(config)
@@ -870,6 +1206,7 @@ def provider_status(request: Request) -> dict[str, Any]:
     state = load_state()
     providers = []
     for provider in config["providers"]:
+        provider_state = provider_state_entry(state, provider["name"])
         providers.append(
             {
                 "name": provider["name"],
@@ -877,10 +1214,11 @@ def provider_status(request: Request) -> dict[str, Any]:
                 "base_url": provider["base_url"],
                 "model": provider.get("model", config["default_model"]),
                 "priority": provider.get("priority", 1000),
-                "enabled": provider.get("enabled", True),
+                "enabled": safe_bool(provider.get("enabled"), True),
                 "key_count": len(provider_api_keys(provider)),
-                "calls": state.get(provider["name"], {}).get("calls", 0),
-                "last_remaining": state.get(provider["name"], {}).get("last_remaining"),
+                "calls": provider_state.get("calls", 0),
+                "last_remaining": provider_state.get("last_remaining"),
+                "health": provider_health(provider["name"], provider_state, state),
             }
         )
     return {"providers": providers}
@@ -890,13 +1228,188 @@ def provider_status(request: Request) -> dict[str, Any]:
 def recent_requests(request: Request) -> dict[str, Any]:
     require_proxy_access(request)
     state = load_state()
-    return {"requests": state.get("_requests", [])[:REQUEST_LOG_LIMIT]}
+    return {"requests": request_log_entries(state, REQUEST_LOG_LIMIT)}
 
 
 @app.get("/api/stats")
 def request_stats(request: Request) -> dict[str, Any]:
     require_proxy_access(request)
     return summarize_request_stats(load_state())
+
+
+@app.delete("/api/observability")
+def clear_observability(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    state = load_state()
+    requests = state.get("_requests")
+    cleared_requests = len(requests) if isinstance(requests, list) else 0
+    cleared_stats = "_stats" in state
+    state["_requests"] = []
+    state.pop("_stats", None)
+    save_state(state)
+    return {
+        "cleared": {
+            "requests": cleared_requests,
+            "stats": cleared_stats,
+        },
+        "requests": [],
+        "stats": summarize_request_stats(state),
+    }
+
+
+ROUTING_PREVIEW_TARGETS: dict[str, set[str]] = {
+    "chat": {"openai", "domestic"},
+    "openai": {"openai"},
+    "responses": {"openai"},
+    "domestic": {"domestic"},
+    "claude": {"claude"},
+    "gemini": {"gemini"},
+}
+
+
+def routing_preview_skip_reason(provider: dict[str, Any], protocols: set[str]) -> tuple[str, str] | None:
+    protocol = provider_protocol(provider)
+    if not safe_bool(provider.get("enabled"), True):
+        return "disabled", "已停用，不会参与本次路由预览。"
+    if not provider.get("name"):
+        return "missing_name", "缺少 provider 名称，无法参与路由。"
+    if not provider.get("base_url"):
+        return "missing_base_url", "缺少 Base URL，无法参与路由。"
+    if not provider_api_keys(provider):
+        return "missing_key", "缺少 API Key，无法参与路由。"
+    if protocol not in protocols:
+        return "protocol_mismatch", f"协议 {protocol} 不属于本次预览目标。"
+    return None
+
+
+def routing_preview_skipped_providers(raw_providers: list[dict[str, Any]], protocols: set[str]) -> list[dict[str, Any]]:
+    skipped: list[dict[str, Any]] = []
+    for provider in sorted(raw_providers, key=safe_provider_priority):
+        provider_with_env = apply_env_overrides(provider)
+        provider_with_env = provider_with_safe_priority(provider_with_env)
+        skip = routing_preview_skip_reason(provider_with_env, protocols)
+        if skip is None:
+            continue
+        reason, message = skip
+        skipped.append(
+            {
+                "name": provider_with_env.get("name") or "未命名 provider",
+                "protocol": provider_protocol(provider_with_env),
+                "priority": safe_provider_priority(provider_with_env),
+                "reason": reason,
+                "message": message,
+            }
+        )
+    return skipped
+
+
+@app.get("/api/routing/preview")
+def routing_preview(request: Request, target: str = "chat") -> dict[str, Any]:
+    require_proxy_access(request)
+    target_key = (target or "chat").strip().lower()
+    protocols = ROUTING_PREVIEW_TARGETS.get(target_key)
+    if protocols is None:
+        allowed = ", ".join(sorted(ROUTING_PREVIEW_TARGETS))
+        raise HTTPException(status_code=400, detail=f"Unknown routing preview target '{target}'. Expected one of: {allowed}")
+
+    raw_config = load_raw_config()
+    config = _filter_config_by_protocol(load_config(), protocols)
+    state = load_state()
+    now = time.time()
+    candidates = order_providers_for_request(config["providers"], state, now=now)
+    selected_provider = candidates[0].provider["name"] if candidates else None
+    status = "ready" if selected_provider else "empty"
+    if selected_provider:
+        message = candidates[0].message or f"下一次 {target_key} 请求会优先尝试 {selected_provider}。"
+    else:
+        message = f"暂无可用于 {target_key} 路由预览的 provider。"
+    profile_by_name = {
+        candidate.provider["name"]: build_provider_routing_profile(candidate.provider, state, index, now=now)
+        for index, candidate in enumerate(candidates)
+    }
+
+    return {
+        "target": target_key,
+        "status": status,
+        "message": message,
+        "protocols": sorted(protocols),
+        "selected_provider": selected_provider,
+        "candidates": [
+            {
+                "name": candidate.provider["name"],
+                "protocol": provider_protocol(candidate.provider),
+                "priority": candidate.provider.get("priority", 1000),
+                "reason": candidate.reason,
+                "routing_reason": candidate.reason,
+                "message": candidate.message,
+                "all_keys_cooling": bool(profile_by_name[candidate.provider["name"]] and profile_by_name[candidate.provider["name"]].all_keys_cooling),
+                "cooldown_seconds": profile_by_name[candidate.provider["name"]].cooldown_seconds if profile_by_name[candidate.provider["name"]] else 0,
+                "degraded": bool(profile_by_name[candidate.provider["name"]] and profile_by_name[candidate.provider["name"]].degraded),
+                "success_rate": profile_by_name[candidate.provider["name"]].success_rate if profile_by_name[candidate.provider["name"]] else None,
+                "avg_latency_ms": round(profile_by_name[candidate.provider["name"]].avg_latency_ms, 2) if profile_by_name[candidate.provider["name"]] else 0,
+                "key_count": len(provider_api_keys(candidate.provider)),
+            }
+            for candidate in candidates
+        ],
+        "skipped_providers": routing_preview_skipped_providers(raw_config.get("providers", []), protocols),
+    }
+
+
+@app.get("/api/model-coverage")
+async def model_coverage(request: Request) -> dict[str, Any]:
+    require_proxy_access(request)
+    config = load_config()
+    semaphore = asyncio.Semaphore(6)
+
+    async def provider_coverage(provider: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                models = await fetch_provider_models(provider)
+                detail = "ok"
+            except Exception as exc:
+                models = []
+                detail = str(exc)
+
+            models = normalize_model_entries(models)
+            fallback_used = False
+            if not models and provider.get("model"):
+                fallback_used = True
+                models = normalize_model_entries([{"id": provider["model"], "object": "model"}])
+
+            model_ids = sorted({model["id"] for model in models})
+            return {
+                "name": provider["name"],
+                "protocol": provider_protocol(provider),
+                "priority": provider.get("priority", 1000),
+                "ok": bool(model_ids),
+                "model_count": len(model_ids),
+                "models": model_ids,
+                "fallback_used": fallback_used,
+                "detail": detail if model_ids or not fallback_used else "使用配置中的默认模型",
+            }
+
+    providers = await asyncio.gather(*(provider_coverage(provider) for provider in config["providers"]))
+    models_by_id: dict[str, dict[str, Any]] = {}
+    for provider in providers:
+        for model_id in provider["models"]:
+            item = models_by_id.setdefault(
+                model_id,
+                {
+                    "id": model_id,
+                    "providers": [],
+                    "protocols": [],
+                },
+            )
+            item["providers"].append(provider["name"])
+            if provider["protocol"] not in item["protocols"]:
+                item["protocols"].append(provider["protocol"])
+
+    return {
+        "total_providers": len(providers),
+        "unique_model_count": len(models_by_id),
+        "providers": providers,
+        "models": sorted(models_by_id.values(), key=lambda item: item["id"]),
+    }
 
 
 @app.post("/api/providers/{provider_name}/check")
@@ -907,7 +1420,11 @@ async def provider_check(provider_name: str, request: Request) -> dict[str, Any]
     raw_names = {provider.get("name") for provider in raw_config.get("providers", []) if provider.get("name")}
     for provider in config["providers"]:
         if provider["name"] == provider_name:
-            result = await check_provider(provider, config["default_model"])
+            try:
+                result = await check_provider(provider, config["default_model"])
+            except Exception as exc:
+                logger.info("provider=%s status=check_error detail=%s", provider_name, exc)
+                result = {"ok": False, "status": "check_error", "detail": str(exc)}
             return {"provider": provider_name, **result}
     if provider_name in raw_names:
         return {
@@ -927,7 +1444,11 @@ async def providers_check_all(request: Request) -> dict[str, Any]:
 
     async def run_check(provider: dict[str, Any]) -> dict[str, Any]:
         async with semaphore:
-            result = await check_provider(provider, config["default_model"])
+            try:
+                result = await check_provider(provider, config["default_model"])
+            except Exception as exc:
+                logger.info("provider=%s status=check_error detail=%s", provider.get("name", "unknown"), exc)
+                result = {"ok": False, "status": "check_error", "detail": str(exc)}
             return {
                 "provider": provider["name"],
                 "protocol": provider_protocol(provider),
@@ -953,8 +1474,34 @@ async def provider_models_endpoint(provider_name: str, request: Request) -> dict
     raw_names = {provider.get("name") for provider in raw_config.get("providers", []) if provider.get("name")}
     for provider in config["providers"]:
         if provider["name"] == provider_name:
-            models = await fetch_provider_models(provider)
-            return {"provider": provider_name, "status": 200, "models": {"object": "list", "data": models}}
+            try:
+                models = normalize_model_entries(await fetch_provider_models(provider))
+            except Exception as exc:
+                logger.info("provider=%s status=model_fetch_error detail=%s", provider_name, exc)
+                models = []
+                fallback_used = False
+                if provider.get("model"):
+                    fallback_used = True
+                    models = normalize_model_entries([{"id": provider["model"], "object": "model"}])
+                return {
+                    "provider": provider_name,
+                    "ok": False,
+                    "status": "model_fetch_error",
+                    "detail": str(exc),
+                    "fallback_used": fallback_used,
+                    "models": {"object": "list", "data": models},
+                }
+            fallback_used = False
+            if not models and provider.get("model"):
+                fallback_used = True
+                models = normalize_model_entries([{"id": provider["model"], "object": "model"}])
+            return {
+                "provider": provider_name,
+                "ok": bool(models),
+                "status": 200,
+                "fallback_used": fallback_used,
+                "models": {"object": "list", "data": models},
+            }
     if provider_name in raw_names:
         return {
             "provider": provider_name,
@@ -975,22 +1522,29 @@ async def provider_models_sync(request: Request) -> dict[str, Any]:
     async def run_fetch(provider: dict[str, Any]) -> dict[str, Any]:
         async with semaphore:
             try:
-                models = await fetch_provider_models(provider)
+                models = normalize_model_entries(await fetch_provider_models(provider))
             except Exception as exc:
+                fallback_used = False
+                models = []
+                if provider.get("model"):
+                    fallback_used = True
+                    models = normalize_model_entries([{"id": provider["model"], "object": "model"}])
                 return {
                     "provider": provider["name"],
                     "protocol": provider_protocol(provider),
                     "model": provider.get("model", config["default_model"]),
                     "ok": False,
-                    "count": 0,
-                    "models": [],
+                    "status": "model_fetch_error",
+                    "count": len(models),
+                    "models": models,
+                    "fallback_used": fallback_used,
                     "detail": str(exc),
                 }
 
             fallback_used = False
             if not models and provider.get("model"):
                 fallback_used = True
-                models = [{"id": provider["model"], "object": "model"}]
+                models = normalize_model_entries([{"id": provider["model"], "object": "model"}])
 
             return {
                 "provider": provider["name"],

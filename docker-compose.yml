@@ -6,13 +6,14 @@ services:
     environment:
       GPT_PROXY_ACCESS_TOKEN: ${GPT_PROXY_ACCESS_TOKEN:-}
       GPT_PROXY_CONFIG_SECRET: ${GPT_PROXY_CONFIG_SECRET:-}
+      GPT_PROXY_CONFIG: ${GPT_PROXY_CONFIG:-/data/config.json}
+      GPT_PROXY_STATE: ${GPT_PROXY_STATE:-/data/state.json}
       GPT_PROXY_RATE_LIMIT_PER_MINUTE: ${GPT_PROXY_RATE_LIMIT_PER_MINUTE:-0}
       GPT_PROXY_MAX_REQUEST_BYTES: ${GPT_PROXY_MAX_REQUEST_BYTES:-2097152}
       GPT_PROXY_KEY_COOLDOWN_SECONDS: ${GPT_PROXY_KEY_COOLDOWN_SECONDS:-60}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      - ./config.json:/app/config.json
-      - ./state.json:/app/state.json
+      - ./data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 30s

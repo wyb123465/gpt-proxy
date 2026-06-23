@@ -159,6 +159,8 @@
         </div>
         <div class="security-grid">
           <div class="status-card"><span>代理访问密钥</span><strong id="proxyTokenState">未启用</strong><small>保护 `/v1/*` 和 `/api/*`</small></div>
+          <div class="status-card"><span>管理端访问</span><strong id="managementAuthState">开放</strong><small>`/api/*` 与管理台</small></div>
+          <div class="status-card"><span>V1 调用认证</span><strong id="v1AuthState">开放</strong><small id="clientKeyCountState">0 个已启用客户端 Key</small></div>
           <div class="status-card"><span>配置加密</span><strong id="encryptionState">未启用</strong><small>`GPT_PROXY_CONFIG_SECRET`</small></div>
           <div class="status-card"><span>本地限流</span><strong id="rateLimitState">未启用</strong><small>`GPT_PROXY_RATE_LIMIT_PER_MINUTE`</small></div>
           <div class="status-card"><span>请求大小限制</span><strong id="bodyLimitState">-</strong><small>`GPT_PROXY_MAX_REQUEST_BYTES`</small></div>
@@ -270,6 +272,7 @@ for chunk in response:
           </div>
           <div class="panel-actions">
             <button id="exportConfigBtn" class="secondary-btn" type="button">导出配置</button>
+            <button id="exportRedactedConfigBtn" class="secondary-btn" type="button">导出脱敏配置</button>
             <button id="importConfigBtn" class="secondary-btn" type="button">导入配置</button>
             <button id="addProviderBtn" class="secondary-btn" type="button">添加 API</button>
             <button id="saveAndTestBtn" class="primary-btn" type="button">保存并测试全部</button>
@@ -319,6 +322,7 @@ for chunk in response:
               <h3>渠道概览</h3>
               <p>参考 new-api 的渠道列表，只保留本地代理需要的状态和入口。</p>
             </div>
+            <button id="refreshModelCoverageBtn" class="secondary-btn" type="button">刷新模型覆盖</button>
           </div>
           <div class="channel-table-wrap">
             <table class="channel-table">
@@ -339,6 +343,7 @@ for chunk in response:
               </tbody>
             </table>
           </div>
+          <div id="modelCoverageGrid" class="model-coverage-grid" hidden></div>
         </div>
 
         <div id="providerList" class="provider-list"></div>
@@ -356,7 +361,10 @@ for chunk in response:
             <h2>最近请求</h2>
             <p>显示最近 50 次后端尝试，方便判断是否发生回退、是否走了流式、流是否完整结束。</p>
           </div>
-          <button id="refreshRequestsBtn" class="secondary-btn" type="button">刷新日志</button>
+          <div class="panel-actions">
+            <button id="refreshRequestsBtn" class="secondary-btn" type="button">刷新日志</button>
+            <button id="clearObservabilityBtn" class="ghost-btn" type="button">清空观测数据</button>
+          </div>
         </div>
         <div id="requestStatsGrid" class="request-stats-grid" aria-label="请求统计"></div>
         <div class="request-filters" aria-label="请求日志筛选">
@@ -385,13 +393,14 @@ for chunk in response:
                 <th>状态</th>
                 <th>耗时</th>
                 <th>回退</th>
+                <th>选择理由</th>
                 <th>模式</th>
                 <th>流状态</th>
                 <th>错误</th>
               </tr>
             </thead>
             <tbody id="requestLogBody">
-              <tr><td colspan="10" class="empty-cell">暂无请求记录</td></tr>
+              <tr><td colspan="11" class="empty-cell">暂无请求记录</td></tr>
             </tbody>
           </table>
         </div>
