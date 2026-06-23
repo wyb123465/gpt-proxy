@@ -1,6 +1,4 @@
 import asyncio
-import fnmatch
-import hmac
 import json
 import logging
 import os
@@ -15,6 +13,18 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from ._auth import (
+    authorize_model_for_rules,
+    enforce_rate_limit as enforce_request_rate_limit,
+    management_auth_mode as auth_management_auth_mode,
+    model_allowed_for_rules,
+    model_matches_any,
+    rate_limit_identity as request_rate_limit_identity,
+    request_token,
+    require_proxy_access_token,
+    secret_matches,
+    v1_auth_mode as auth_v1_auth_mode,
+)
 from ._config import (
     apply_env_overrides,
     client_key_entries,
@@ -424,19 +434,11 @@ def load_config() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def require_proxy_access(request: Request) -> None:
-    if not PROXY_ACCESS_TOKEN:
-        return
-    if hmac.compare_digest(_request_token(request), PROXY_ACCESS_TOKEN):
-        return
-    raise HTTPException(status_code=401, detail="Missing or invalid local proxy access token")
+    require_proxy_access_token(request, PROXY_ACCESS_TOKEN)
 
 
 def _request_token(request: Request) -> str:
-    auth_header = request.headers.get("authorization", "")
-    x_api_key = request.headers.get("x-api-key", "")
-    if auth_header.lower().startswith("bearer "):
-        return auth_header[7:].strip()
-    return x_api_key.strip()
+    return request_token(request)
 
 
 def _enabled_client_keys() -> list[dict[str, Any]]:
@@ -456,24 +458,15 @@ def enabled_client_key_count(config: dict[str, Any]) -> int:
 
 
 def management_auth_mode() -> str:
-    return "proxy_token" if PROXY_ACCESS_TOKEN else "open"
+    return auth_management_auth_mode(PROXY_ACCESS_TOKEN)
 
 
 def v1_auth_mode(config: dict[str, Any]) -> str:
-    has_proxy_token = bool(PROXY_ACCESS_TOKEN)
-    has_client_keys = enabled_client_key_count(config) > 0
-    if has_proxy_token and has_client_keys:
-        return "proxy_token_or_client_keys"
-    if has_proxy_token:
-        return "proxy_token"
-    if has_client_keys:
-        return "client_keys"
-    return "open"
+    return auth_v1_auth_mode(PROXY_ACCESS_TOKEN, enabled_client_key_count(config) > 0)
 
 
 def _model_matches_any(model: str, patterns: list[str]) -> bool:
-    normalized = model.strip().lower()
-    return any(fnmatch.fnmatchcase(normalized, pattern.strip().lower()) for pattern in patterns if pattern.strip())
+    return model_matches_any(model, patterns)
 
 
 def _model_allowed_for_client_key(client_key: dict[str, Any], model: str | None) -> bool:
@@ -481,11 +474,7 @@ def _model_allowed_for_client_key(client_key: dict[str, Any], model: str | None)
         return True
     allowed_models = client_key_model_rules(client_key, "allowed_models")
     excluded_models = client_key_model_rules(client_key, "excluded_models")
-    if allowed_models and not _model_matches_any(model, allowed_models):
-        return False
-    if excluded_models and _model_matches_any(model, excluded_models):
-        return False
-    return True
+    return model_allowed_for_rules(model, allowed_models, excluded_models)
 
 
 def _authorize_model_for_client_key(client_key: dict[str, Any], model: str | None) -> None:
@@ -493,15 +482,12 @@ def _authorize_model_for_client_key(client_key: dict[str, Any], model: str | Non
         return
     allowed_models = client_key_model_rules(client_key, "allowed_models")
     excluded_models = client_key_model_rules(client_key, "excluded_models")
-    if allowed_models and not _model_matches_any(model, allowed_models):
-        raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this local client key")
-    if excluded_models and _model_matches_any(model, excluded_models):
-        raise HTTPException(status_code=403, detail=f"Model '{model}' is excluded for this local client key")
+    authorize_model_for_rules(model, allowed_models, excluded_models)
 
 
 def authorize_v1_access(request: Request, model: str | None = None) -> dict[str, Any] | None:
     token = _request_token(request)
-    if PROXY_ACCESS_TOKEN and hmac.compare_digest(token, PROXY_ACCESS_TOKEN):
+    if secret_matches(token, PROXY_ACCESS_TOKEN):
         request.state.client_key_label = "proxy-token"
         return None
 
@@ -513,7 +499,7 @@ def authorize_v1_access(request: Request, model: str | None = None) -> dict[str,
         return None
 
     for client_key in client_keys:
-        if hmac.compare_digest(token, safe_secret_value(client_key.get("key", ""))):
+        if secret_matches(token, safe_secret_value(client_key.get("key", ""))):
             request.state.client_key_label = client_key.get("label") or client_key.get("id") or "client-key"
             _authorize_model_for_client_key(client_key, model)
             return client_key
@@ -526,31 +512,11 @@ def authorize_v1_request(request: Request, body: dict[str, Any]) -> dict[str, An
 
 
 def rate_limit_identity(request: Request) -> str:
-    token = _request_token(request)
-    if token:
-        return f"token:{key_fingerprint(token)}"
-    client_host = request.client.host if request.client else "local"
-    return f"host:{client_host}"
+    return request_rate_limit_identity(request)
 
 
 def enforce_rate_limit(request: Request) -> None:
-    if RATE_LIMIT_PER_MINUTE <= 0:
-        return
-    identity = rate_limit_identity(request)
-    now = time.time()
-    window_start = now - 60
-
-    stale_threshold = now - 120
-    stale_keys = [k for k, v in RATE_LIMIT_BUCKETS.items() if not v or v[-1] < stale_threshold]
-    for k in stale_keys:
-        del RATE_LIMIT_BUCKETS[k]
-
-    bucket = [timestamp for timestamp in RATE_LIMIT_BUCKETS.get(identity, []) if timestamp > window_start]
-    if len(bucket) >= RATE_LIMIT_PER_MINUTE:
-        RATE_LIMIT_BUCKETS[identity] = bucket
-        raise HTTPException(status_code=429, detail="Local proxy rate limit exceeded")
-    bucket.append(now)
-    RATE_LIMIT_BUCKETS[identity] = bucket
+    enforce_request_rate_limit(request, RATE_LIMIT_BUCKETS, RATE_LIMIT_PER_MINUTE)
 
 
 async def read_json_body(request: Request) -> Any:
@@ -772,15 +738,22 @@ def _stream_callback(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    async def _curl_stream_gen(async_iter):
-        async for chunk in async_iter:
-            yield chunk
+    async def _curl_stream_gen(async_iter, log_entry: dict[str, Any]):
+        try:
+            async for chunk in async_iter:
+                yield chunk
+        except Exception as exc:
+            log_entry["stream_status"] = "stream_error"
+            log_entry["error"] = str(exc)
+            raise
+        else:
+            log_entry["stream_status"] = "stream_complete"
+        finally:
+            append_request_log(log_entry)
 
     if hasattr(data, "__aiter__"):
         log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision)
-        log_entry["stream_status"] = "stream_complete"
-        append_request_log(log_entry)
-        return StreamingResponse(_curl_stream_gen(data), media_type="text/event-stream",
+        return StreamingResponse(_curl_stream_gen(data, log_entry), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     log_entry = request_log_entry(provider_name, 200, started_at, fallback_count, streamed=True, path=path, model=log_model, client_key=client_key_label, route_decision=route_decision)

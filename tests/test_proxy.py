@@ -2729,6 +2729,50 @@ def test_streaming_chat_completion_proxies_event_stream(tmp_path, monkeypatch):
     assert "data: [DONE]" in body
 
 
+def test_curl_streaming_logs_error_after_iterator_failure(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "_state_cache", None, raising=False)
+    monkeypatch.setattr(main, "_state_cache_path", None, raising=False)
+
+    async def failing_stream():
+        yield b"data: partial\n\n"
+        raise RuntimeError("curl stream failed")
+
+    response = main._stream_callback(
+        failing_stream(),
+        "official",
+        main.time.perf_counter(),
+        0,
+        [(0, "test-key")],
+        0,
+        None,
+        True,
+        "/v1/chat/completions",
+        "gpt-4o",
+        "",
+        None,
+    )
+
+    async def consume_stream():
+        chunks = []
+        try:
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+        except RuntimeError as exc:
+            assert str(exc) == "curl stream failed"
+            return chunks
+        raise AssertionError("expected curl stream failure")
+
+    chunks = main.asyncio.run(consume_stream())
+
+    assert chunks == [b"data: partial\n\n"]
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["_requests"][0]["stream_status"] == "stream_error"
+    assert saved["_requests"][0]["error"] == "curl stream failed"
+
+
 def test_proxy_access_token_protects_v1_endpoints(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"
