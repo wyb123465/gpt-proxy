@@ -887,6 +887,68 @@ button:disabled {
 
 .channel-table tr:last-child td { border-bottom: 0; }
 
+.model-coverage-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.6fr) repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.coverage-summary-card,
+.coverage-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.coverage-summary-card strong {
+  font-size: 22px;
+  letter-spacing: -0.02em;
+}
+
+.coverage-summary-card span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.coverage-card > strong {
+  font-size: 13px;
+}
+
+.coverage-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.8fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid rgba(20, 30, 45, 0.08);
+}
+
+.coverage-row span {
+  overflow: hidden;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.coverage-row small {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.coverage-row em {
+  min-width: 26px;
+  color: var(--muted);
+  font-style: normal;
+  text-align: right;
+}
+
 .diagnostic-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1298,7 +1360,7 @@ button:disabled {
   .nav-item { min-height: 52px; }
   .nav-item:hover { transform: none; }
   .provider-actions { width: 100%; }
-  .summary, .quickstart, .overview-grid, .overview-callout, .protocol-builder, .preset-grid, .client-key-grid, .request-stats-grid { grid-template-columns: 1fr; }
+  .summary, .quickstart, .overview-grid, .overview-callout, .protocol-builder, .preset-grid, .client-key-grid, .request-stats-grid, .model-coverage-grid { grid-template-columns: 1fr; }
   .client-key-head, .client-key-card-head {
     align-items: flex-start;
     flex-direction: column;
@@ -1392,9 +1454,11 @@ button:disabled {
 }
 
 .ok-text { color: var(--success); font-weight: 800; }
+.warn-text { color: var(--warning); font-weight: 800; }
 .error-text { color: var(--danger); font-weight: 800; }
 
-.error-detail {
+.error-detail,
+.route-detail {
   max-width: 280px;
   color: var(--muted);
   overflow-wrap: anywhere;
