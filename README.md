@@ -61,7 +61,7 @@ Windows 上也可以双击：
 - `start-ui.bat`：启动服务并打开管理台
 - `stop.bat`：停止本项目占用的服务进程
 
-如果需要固定本地访问 Token、限流或配置加密，可以复制 `.env.example` 为 `.env` 后填写；`start.ps1`、`start-ui.ps1` 和 Docker Compose 都会读取它。
+如果需要固定本地访问 Token、限流或配置加密，可以复制 `.env.example` 为 `.env` 后填写；`start.ps1` 和 `start-ui.ps1` 都会读取它。
 
 ## 本机统一调用方式
 
@@ -187,24 +187,6 @@ $env:LOG_LEVEL="INFO"
 - `GPT_PROXY_STATE`：自定义运行状态文件路径，默认是项目目录下的 `state.json`
 - `LOG_LEVEL`：服务日志级别，可选 `DEBUG`、`INFO`、`WARNING`、`ERROR`
 
-## Docker 可选部署
-
-```powershell
-New-Item data -ItemType Directory -Force
-copy config.example.json data\config.json
-docker compose up --build
-```
-
-复制后先在管理台或 `data/config.json` 中填入真实 API Key 并启用 provider；模板默认保持禁用，避免占位密钥被误当成真实凭据。
-
-Docker 版本默认监听：
-
-```text
-http://127.0.0.1:8000/
-```
-
-Docker Compose 会把本机 `./data` 挂载到容器 `/data`，配置和状态分别写入 `data/config.json` 与 `data/state.json`。`.dockerignore` 会排除 `config.json`、`state.json`、`.env`、`data/` 等本地敏感文件，避免真实密钥被打进镜像。
-
 ## 开发与测试
 
 ```powershell
@@ -226,7 +208,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check-powershell.p
 .\scripts\smoke.ps1 -IncludeUpstream
 ```
 
-如果仓库配置了 CI，建议在 push 和 pull request 时运行 Python 测试、前端 JavaScript 语法检查、PowerShell 脚本检查、无上游请求的本地服务冒烟检查，以及 Docker 镜像构建。
+如果仓库配置了 CI，建议在 push 和 pull request 时运行 Python 测试、前端 JavaScript 语法检查、PowerShell 脚本检查，以及无上游请求的本地服务冒烟检查。
 
 ## 停止服务
 
