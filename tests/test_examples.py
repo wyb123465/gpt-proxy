@@ -48,3 +48,20 @@ def test_env_example_variables_are_documented():
         if not re.search(rf"(?<![A-Z0-9_]){re.escape(variable)}(?![A-Z0-9_])", readme)
     )
     assert missing == []
+
+
+def test_project_facing_examples_do_not_reference_removed_deployment_stack():
+    example_files = [
+        main.BASE_DIR / ".env.example",
+        main.BASE_DIR / "README.md",
+        main.BASE_DIR / "config.example.json",
+    ]
+    removed_terms = "|".join(["dock" + "er", "com" + "pose"])
+
+    offenders = [
+        path.name
+        for path in example_files
+        if re.search(removed_terms, path.read_text(encoding="utf-8"), re.IGNORECASE)
+    ]
+
+    assert offenders == []

@@ -3031,6 +3031,65 @@ def test_v1_client_key_model_rules_accept_hand_edited_strings(tmp_path, monkeypa
     assert blocked.json()["detail"] == "Model 'gpt-image-2' is excluded for this local client key"
 
 
+def test_gemini_path_model_is_checked_against_client_key_policy(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_model": "gpt-4o",
+                "providers": [
+                    {
+                        "name": "gemini",
+                        "protocol": "gemini",
+                        "base_url": "https://gemini.example/v1beta",
+                        "priority": 0,
+                        "api_keys": ["gemini-key"],
+                    }
+                ],
+                "client_keys": [
+                    {
+                        "id": "chatbox",
+                        "label": "ChatBox",
+                        "key": "client-secret",
+                        "enabled": True,
+                        "allowed_models": ["gpt-*"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+    monkeypatch.setattr(main, "PROXY_ACCESS_TOKEN", "", raising=False)
+
+    upstream_called = False
+
+    def handler(request):
+        nonlocal upstream_called
+        upstream_called = True
+        return httpx.Response(200, json={"candidates": []})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1beta/models/gemini-2.0-flash:generateContent",
+        headers={"Authorization": "Bearer client-secret"},
+        json={"contents": [{"parts": [{"text": "Hello"}]}]},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Model 'gemini-2.0-flash' is not allowed for this local client key"
+    assert upstream_called is False
+
+
 def test_v1_auth_ignores_malformed_client_key_entries(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"

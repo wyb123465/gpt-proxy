@@ -14,7 +14,7 @@ logger = logging.getLogger("gpt_proxy")
 class V1RouteServices:
     read_v1_json_body: Callable[[Request], Awaitable[dict[str, Any]]]
     load_config: Callable[[], dict[str, Any]]
-    authorize_v1_access: Callable[[Request], dict[str, Any] | None]
+    authorize_v1_access: Callable[[Request, str | None], dict[str, Any] | None]
     enforce_rate_limit: Callable[[Request], None]
     model_allowed_for_client_key: Callable[[dict[str, Any], str | None], bool]
     fetch_provider_models: Callable[[dict[str, Any]], Awaitable[list[dict[str, Any]]]]
@@ -86,6 +86,7 @@ def register_v1_routes(app: FastAPI, services: V1RouteServices) -> None:
         model, verb = rest.rsplit(":", 1)
         if verb not in {"generateContent", "streamGenerateContent"}:
             raise HTTPException(status_code=404, detail=f"Unsupported Gemini verb: {verb}. Supported verbs: generateContent, streamGenerateContent")
+        services.authorize_v1_access(request, model)
         if verb == "streamGenerateContent" or request.query_params.get("alt") == "sse":
             body["stream"] = True
         path_suffix = f"/models/{model}:{verb}"
@@ -93,7 +94,7 @@ def register_v1_routes(app: FastAPI, services: V1RouteServices) -> None:
 
     @app.get("/v1/models")
     async def list_models(request: Request) -> dict[str, Any]:
-        client_key = services.authorize_v1_access(request)
+        client_key = services.authorize_v1_access(request, None)
         services.enforce_rate_limit(request)
         config = services.load_config()
         seen = set()
