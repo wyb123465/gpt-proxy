@@ -90,7 +90,16 @@ def register_v1_routes(app: FastAPI, services: V1RouteServices) -> None:
         if verb == "streamGenerateContent" or request.query_params.get("alt") == "sse":
             body["stream"] = True
         path_suffix = f"/models/{model}:{verb}"
-        return await passthrough(body, config, request, services.proxy_services(), "gemini", path_suffix, f"/v1beta/models/{rest}")
+        return await passthrough(
+            body,
+            config,
+            request,
+            services.proxy_services(),
+            "gemini",
+            "/models/{model}:" + verb,
+            f"/v1beta/models/{rest}",
+            path_model=model,
+        )
 
     @app.get("/v1/models")
     async def list_models(request: Request) -> dict[str, Any]:

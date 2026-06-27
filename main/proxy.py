@@ -76,16 +76,17 @@ async def _try_provider(
         protocol = provider_protocol(provider)
     passthrough = bool(fwd)
     path_suffix = (fwd or {}).get("path_suffix", "/chat/completions")
+    path_model = (fwd or {}).get("path_model")
 
     if should_use_curl(provider):
         if stream:
             url, headers, request_body = _prepare_forward(
-                body, provider, default_model, api_key, protocol, path_suffix, passthrough
+                body, provider, default_model, api_key, protocol, path_suffix, passthrough, path_model
             )
             return ("curl_stream", curl_stream_request(url, headers, request_body))
         status_code, data = await curl_forward_to_provider(
             body, provider, default_model, api_key,
-            protocol=protocol, path_suffix=path_suffix, passthrough=passthrough,
+            protocol=protocol, path_suffix=path_suffix, passthrough=passthrough, path_model=path_model,
         )
         if status_code == 200:
             return ("curl", data)
@@ -97,14 +98,14 @@ async def _try_provider(
     try:
         if stream:
             url, headers, request_body = _prepare_forward(
-                body, provider, default_model, api_key, protocol, path_suffix, passthrough
+                body, provider, default_model, api_key, protocol, path_suffix, passthrough, path_model
             )
             upstream_request = client.build_request("POST", url, headers=headers, json=request_body)
             response = await client.send(upstream_request, stream=True)
         else:
             response = await forward_to_provider(
                 client, body, provider, default_model, api_key,
-                protocol=protocol, path_suffix=path_suffix, passthrough=passthrough,
+                protocol=protocol, path_suffix=path_suffix, passthrough=passthrough, path_model=path_model,
             )
     except httpx.RequestError:
         raise
@@ -325,8 +326,11 @@ async def passthrough(
     protocol: str,
     path_suffix: str,
     inbound_path: str,
+    path_model: str | None = None,
 ) -> Any:
     fwd = {"protocol": protocol, "path_suffix": path_suffix}
+    if path_model is not None:
+        fwd["path_model"] = path_model
     if body.get("stream") is True:
         return await stream_chat_completions(body, config, services, request=request, path=inbound_path, fwd=fwd)
     return await proxy_chat_json(body, config, services, request=request, path=inbound_path, fwd=fwd)

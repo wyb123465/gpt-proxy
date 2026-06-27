@@ -408,6 +408,7 @@ def _prepare_forward(
     protocol: str,
     path_suffix: str,
     passthrough: bool,
+    path_model: str | None = None,
 ) -> tuple[str, dict[str, str], Any]:
     """Compute (url, headers, request_body) for one forward call.
 
@@ -420,7 +421,8 @@ def _prepare_forward(
         url = f"{provider['base_url'].rstrip('/')}/chat/completions"
         return url, build_forward_headers(api_key), build_request_body(body, provider, default_model)
 
-    model = resolve_model(body, provider, default_model)
+    model_source = {"model": path_model} if path_model is not None else body
+    model = resolve_model(model_source, provider, default_model)
     resolved_suffix = path_suffix.replace("{model}", model) if path_suffix else "/chat/completions"
     url = passthrough_url(provider, resolved_suffix)
     headers = passthrough_headers(protocol, api_key)
@@ -437,9 +439,10 @@ async def forward_to_provider(
     protocol: str = "openai",
     path_suffix: str = "/chat/completions",
     passthrough: bool = False,
+    path_model: str | None = None,
 ) -> httpx.Response:
     url, headers, request_body = _prepare_forward(
-        body, provider, default_model, api_key, protocol, path_suffix, passthrough
+        body, provider, default_model, api_key, protocol, path_suffix, passthrough, path_model
     )
     return await client.post(url, headers=headers, json=request_body)
 
@@ -453,9 +456,10 @@ async def curl_forward_to_provider(
     protocol: str = "openai",
     path_suffix: str = "/chat/completions",
     passthrough: bool = False,
+    path_model: str | None = None,
 ) -> tuple[int, Any]:
     url, headers, request_body = _prepare_forward(
-        body, provider, default_model, api_key, protocol, path_suffix, passthrough
+        body, provider, default_model, api_key, protocol, path_suffix, passthrough, path_model
     )
     status_code, response_text = await curl_request(url, headers, request_body, timeout)
     try:

@@ -4164,6 +4164,49 @@ def test_gemini_protocol_routes_correctly(tmp_path, monkeypatch):
     assert seen_request["headers"]["x-goog-api-key"] == "gemini-test-key"
 
 
+def test_gemini_path_model_alias_is_applied_to_upstream_url(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    state_path = tmp_path / "state.json"
+    write_config(
+        config_path,
+        [
+            {
+                "name": "gemini",
+                "protocol": "gemini",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                "priority": 0,
+                "api_keys": ["gemini-test-key"],
+                "model_aliases": {"gemini-public": "gemini-2.0-flash"},
+            }
+        ],
+    )
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "STATE_PATH", state_path)
+
+    seen_request = {}
+
+    def handler(request):
+        seen_request["url"] = str(request.url)
+        return httpx.Response(200, json={"candidates": []})
+
+    monkeypatch.setattr(
+        main,
+        "create_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=30.0),
+    )
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1beta/models/gemini-public:generateContent",
+        json={"contents": [{"parts": [{"text": "Hello"}]}]},
+    )
+
+    assert response.status_code == 200
+    assert "gemini-2.0-flash:generateContent" in seen_request["url"]
+    assert "gemini-public:generateContent" not in seen_request["url"]
+
+
 def test_domestic_protocol_with_deepseek(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     state_path = tmp_path / "state.json"
